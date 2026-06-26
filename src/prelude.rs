@@ -60,9 +60,18 @@ impl Prelude {
     ///
     /// Suitable as the resolver for `quick_xml`'s `unescape_with`.
     pub fn resolve_entity(&self, name: &str) -> Option<&str> {
-        if let Some(predefined) = resolve_predefined_entity(name) {
-            return Some(predefined);
-        }
-        self.entities.get(name).map(|s| &**s)
+        lookup_entity(&self.entities, name)
     }
+}
+
+/// Resolve an entity name against the predefined XML entities, then a custom
+/// entity map. Shared by [`Prelude::resolve_entity`] and the sequential reader.
+pub(crate) fn lookup_entity<'a>(
+    entities: &'a HashMap<Box<str>, Box<str>>,
+    name: &str,
+) -> Option<&'a str> {
+    if let Some(predefined) = resolve_predefined_entity(name) {
+        return Some(predefined);
+    }
+    entities.get(name).map(|s| &**s)
 }

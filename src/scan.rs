@@ -161,7 +161,7 @@ impl<'a> Scanner<'a> {
                 let off = memmem::find(&self.buf[start..], b"-->").ok_or(XmlError::Malformed(i))?;
                 i = start + off + 3;
             } else if in_subset && self.buf[i..].starts_with(b"<!ENTITY") {
-                i = self.parse_entity_decl(i, entities)?;
+                i = parse_entity_decl(self.buf, i, entities)?;
             } else if b == b'[' {
                 in_subset = true;
                 i += 1;
@@ -176,50 +176,6 @@ impl<'a> Scanner<'a> {
             }
         }
         Err(XmlError::Malformed(self.pos))
-    }
-
-    /// Parse one `<!ENTITY …>` declaration starting at `i`; capture general
-    /// internal entities (`<!ENTITY name "value">`) and skip parameter/external
-    /// ones. Returns the offset just past the declaration's `>`.
-    fn parse_entity_decl(
-        &self,
-        i: usize,
-        entities: &mut HashMap<Box<str>, Box<str>>,
-    ) -> Result<usize, XmlError> {
-        let n = self.buf.len();
-        let mut j = i + b"<!ENTITY".len();
-        skip_ws_at(self.buf, &mut j);
-
-        // Parameter entity (`<!ENTITY % …>`) — out of scope.
-        if j < n && self.buf[j] == b'%' {
-            return skip_decl_to_gt(self.buf, i);
-        }
-
-        let name_start = j;
-        while j < n && is_name_char(self.buf[j]) {
-            j += 1;
-        }
-        let name = &self.buf[name_start..j];
-        if name.is_empty() {
-            return Err(XmlError::Malformed(i));
-        }
-        skip_ws_at(self.buf, &mut j);
-
-        // Internal entity: a quoted replacement value. Anything else (SYSTEM /
-        // PUBLIC) is external — skip without capturing.
-        if j < n && (self.buf[j] == b'"' || self.buf[j] == b'\'') {
-            let q = self.buf[j];
-            j += 1;
-            let off = memchr(q, &self.buf[j..]).ok_or(XmlError::Malformed(j))?;
-            let value = &self.buf[j..j + off];
-            j += off + 1;
-            let name = utf8(name)?;
-            let value = utf8(value)?;
-            entities.insert(name.into(), value.into());
-            skip_decl_to_gt(self.buf, j)
-        } else {
-            skip_decl_to_gt(self.buf, i)
-        }
     }
 
     // --- Root -------------------------------------------------------------
@@ -448,6 +404,63 @@ fn is_xml_ws(b: u8) -> bool {
 fn skip_ws_at(buf: &[u8], i: &mut usize) {
     while *i < buf.len() && is_xml_ws(buf[*i]) {
         *i += 1;
+    }
+}
+
+/// Parse internal-subset `<!ENTITY>` declarations out of a DOCTYPE body (the
+/// bytes between `<!DOCTYPE` and its closing `>`, e.g. as surfaced by
+/// `quick_xml`'s `DocType` event). Best-effort: malformed declarations are
+/// skipped. Used by the sequential reader, which has no Phase A [`Prelude`].
+pub(crate) fn parse_doctype_entities(body: &[u8], out: &mut HashMap<Box<str>, Box<str>>) {
+    let mut i = 0;
+    while let Some(off) = memmem::find(&body[i..], b"<!ENTITY") {
+        let start = i + off;
+        i = match parse_entity_decl(body, start, out) {
+            Ok(next) => next,
+            Err(_) => start + b"<!ENTITY".len(), // skip the token, keep going
+        };
+    }
+}
+
+/// Parse one `<!ENTITY …>` declaration starting at `i`; capture general internal
+/// entities (`<!ENTITY name "value">`) and skip parameter/external ones. Returns
+/// the offset just past the declaration's `>`.
+fn parse_entity_decl(
+    buf: &[u8],
+    i: usize,
+    entities: &mut HashMap<Box<str>, Box<str>>,
+) -> Result<usize, XmlError> {
+    let n = buf.len();
+    let mut j = i + b"<!ENTITY".len();
+    skip_ws_at(buf, &mut j);
+
+    // Parameter entity (`<!ENTITY % …>`) — out of scope.
+    if j < n && buf[j] == b'%' {
+        return skip_decl_to_gt(buf, i);
+    }
+
+    let name_start = j;
+    while j < n && is_name_char(buf[j]) {
+        j += 1;
+    }
+    let name = &buf[name_start..j];
+    if name.is_empty() {
+        return Err(XmlError::Malformed(i));
+    }
+    skip_ws_at(buf, &mut j);
+
+    // Internal entity: a quoted replacement value. Anything else (SYSTEM /
+    // PUBLIC) is external — skip without capturing.
+    if j < n && (buf[j] == b'"' || buf[j] == b'\'') {
+        let q = buf[j];
+        j += 1;
+        let off = memchr(q, &buf[j..]).ok_or(XmlError::Malformed(j))?;
+        let value = &buf[j..j + off];
+        j += off + 1;
+        entities.insert(utf8(name)?.into(), utf8(value)?.into());
+        skip_decl_to_gt(buf, j)
+    } else {
+        skip_decl_to_gt(buf, i)
     }
 }
 

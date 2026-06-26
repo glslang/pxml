@@ -71,29 +71,44 @@ impl<'doc> RecordReader<'doc> {
             }
         }
 
-        let index = self.index;
-        let prelude: &Prelude = self.prelude.as_ref();
-        let event = match self.current.as_ref().expect("event stored above") {
-            QxEvent::Start(e) | QxEvent::Empty(e) => Event::Start {
-                name: e.name(),
-                attrs: Attrs::new(e.attributes_raw(), prelude, index),
-            },
-            QxEvent::End(e) => Event::End { name: e.name() },
-            QxEvent::Text(e) => {
-                let text = e
-                    .unescape_with(|name| prelude.resolve_entity(name))
-                    .map_err(|err| record_error(index, err))?;
-                Event::Text(text)
-            }
-            QxEvent::CData(e) => {
-                let bytes: &[u8] = e;
-                Event::Cdata(bytes)
-            }
-            // Comment/PI/Decl/DocType are skipped above; Eof returns early.
-            _ => unreachable!("non-surfaced event was stored"),
-        };
+        let event = map_event(
+            self.current.as_ref().expect("event stored above"),
+            self.prelude.as_ref(),
+            self.index,
+        )?;
         Ok(Some(event))
     }
+}
+
+/// Map a (surfaced) `quick_xml` event to a [`crate::Event`], resolving text and
+/// attribute entities against `prelude`. Shared by [`RecordReader`] and the
+/// crate's sequential reader. `index` tags any decode error.
+///
+/// Only `Start`/`Empty`/`End`/`Text`/`CData` are valid here; callers must skip
+/// comments/PIs/declarations and handle `Eof` before calling.
+pub(crate) fn map_event<'e>(
+    ev: &'e QxEvent<'e>,
+    prelude: &'e Prelude,
+    index: usize,
+) -> Result<Event<'e>, XmlError> {
+    Ok(match ev {
+        QxEvent::Start(e) | QxEvent::Empty(e) => Event::Start {
+            name: e.name(),
+            attrs: Attrs::new(e.attributes_raw(), prelude, index),
+        },
+        QxEvent::End(e) => Event::End { name: e.name() },
+        QxEvent::Text(e) => {
+            let text = e
+                .unescape_with(|name| prelude.resolve_entity(name))
+                .map_err(|err| record_error(index, err))?;
+            Event::Text(text)
+        }
+        QxEvent::CData(e) => {
+            let bytes: &[u8] = e;
+            Event::Cdata(bytes)
+        }
+        _ => unreachable!("non-surfaced event passed to map_event"),
+    })
 }
 
 fn record_error(
