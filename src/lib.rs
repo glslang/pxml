@@ -22,7 +22,7 @@ mod prelude;
 mod scan;
 
 pub use config::Config;
-pub use event::{Attrs, Event};
+pub use event::{AttrIter, Attribute, Attrs, Event};
 pub use parse::RecordReader;
 pub use prelude::{Encoding, NamespaceContext, Prelude};
 pub use scan::ChunkIndex;
@@ -128,7 +128,7 @@ pub struct Record<'doc> {
 impl<'doc> Record<'doc> {
     /// A StAX pull cursor over this record's events.
     pub fn events(&self) -> RecordReader<'doc> {
-        RecordReader::new(self.bytes, self.prelude.clone())
+        RecordReader::new(self.bytes, self.prelude.clone(), self.index)
     }
 
     /// This record's position in document order.

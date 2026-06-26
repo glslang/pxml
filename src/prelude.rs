@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use quick_xml::escape::resolve_predefined_entity;
+
 /// Resolved document encoding. The buffer is normalized to (or asserted as)
 /// UTF-8 before slicing, so workers always see UTF-8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,4 +51,18 @@ pub struct Prelude {
     pub namespaces: NamespaceContext,
     /// Internal-subset `<!ENTITY>` definitions (name -> replacement text).
     pub entities: HashMap<Box<str>, Box<str>>,
+}
+
+impl Prelude {
+    /// Resolve an entity reference by name for unescaping. Predefined XML
+    /// entities (`lt`, `gt`, `amp`, `apos`, `quot`) take precedence; otherwise
+    /// the internal-subset `<!ENTITY>` definitions captured in Phase A are used.
+    ///
+    /// Suitable as the resolver for `quick_xml`'s `unescape_with`.
+    pub fn resolve_entity(&self, name: &str) -> Option<&str> {
+        if let Some(predefined) = resolve_predefined_entity(name) {
+            return Some(predefined);
+        }
+        self.entities.get(name).map(|s| &**s)
+    }
 }
