@@ -9,7 +9,9 @@ them **in parallel** on a [`rayon`] pool. The soundness assumption is that the
 direct children of the root are independent and may be consumed in any order.
 
 > Status: v1. The full architecture from [`DESIGN.md`](DESIGN.md) is implemented
-> and tested. See [Limitations](#limitations) for the honest caveats.
+> and tested. See [Limitations](#limitations) for the honest caveats, and
+> [`DECISIONS.md`](DECISIONS.md) for the design decisions, trade-offs, and
+> benchmark analysis behind the implementation.
 
 ## Why
 
@@ -198,10 +200,17 @@ Run the included benchmark (release is essential):
 ```sh
 cargo run --release --example bench                 # 200k records, auto thread sweep
 cargo run --release --example bench -- 500000 1,4,8 # 500k records, explicit threads
+
+cargo run --release --example bench -- gen 1000000 trades.xml.zst  # write a .zst
+cargo run --release --example bench -- file trades.xml.zst         # resident vs streaming
 ```
 
-It prints a sequential baseline and `par_for_each` across thread counts, with
-throughput and speedup, plus a small-input fallback demonstration.
+The in-memory mode prints a sequential baseline and `par_for_each` across thread
+counts (throughput + speedup) plus a small-input fallback demonstration. The
+`file` mode compares the resident `from_path` path against the streaming
+`from_zstd_reader` path on a real file. See [`DECISIONS.md`](DECISIONS.md) §15 for
+measured numbers and analysis (notably: streaming trades throughput for bounded
+memory).
 
 ## What's handled
 

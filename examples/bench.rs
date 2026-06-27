@@ -1,20 +1,22 @@
 //! Synthetic N-record benchmark for `pxml`.
 //!
-//! Generates a `<trades>` document of N uniform records, then compares a
-//! sequential pass against `par_for_each` across a range of thread counts,
-//! reporting wall time, throughput, and speedup. Also demonstrates the
-//! small-input sequential fallback.
-//!
-//! Run (release is important for meaningful numbers):
+//! Three modes:
 //!
 //! ```sh
-//! cargo run --release --example bench                # defaults: 200k records
-//! cargo run --release --example bench -- 500000      # 500k records
-//! cargo run --release --example bench -- 200000 1,4,8 # explicit thread counts
+//! # In-memory: sequential baseline vs par_for_each across thread counts.
+//! cargo run --release --example bench                 # 200k records
+//! cargo run --release --example bench -- 500000 1,4,8 # N records, explicit threads
+//!
+//! # Write a zstd-compressed file of N records.
+//! cargo run --release --example bench -- gen 1000000 trades.xml.zst
+//!
+//! # Benchmark parsing a file: resident path (from_path, decompress-whole) vs
+//! # the bounded-memory streaming path (from_zstd_reader) for zstd inputs.
+//! cargo run --release --example bench -- file trades.xml.zst
 //! ```
 //!
 //! See `DESIGN.md` ("Verification plan"): expect sub-linear (~3–6x) scaling,
-//! bounded by the sequential Phase A scan and memory bandwidth.
+//! bounded by the sequential Phase A scan / decompression and memory bandwidth.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -24,42 +26,18 @@ use std::time::{Duration, Instant};
 use pxml::{Config, Event, ParallelXml, Record};
 use rayon::ThreadPoolBuilder;
 
+const MIB: f64 = (1u64 << 20) as f64;
+
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let n: usize = args
-        .next()
-        .and_then(|a| a.parse().ok())
-        .unwrap_or(200_000);
-    let threads: Vec<usize> = match args.next() {
-        Some(list) => list.split(',').filter_map(|t| t.parse().ok()).collect(),
-        None => default_thread_counts(),
-    };
-
-    let data = generate(n);
-    println!(
-        "document: {n} records, {:.1} MiB\n",
-        data.len() as f64 / (1usize << 20) as f64
-    );
-
-    // Warm up caches, the allocator, and the global thread pool.
-    black_box(drive(&build(&data, parallel_config())));
-
-    let baseline = time(|| drive(&build(&data, sequential_config())));
-    report("sequential (fallback path)", baseline, n, data.len(), None);
-
-    for &t in &threads {
-        let px = build(&data, parallel_config());
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(t)
-            .build()
-            .expect("thread pool");
-        let elapsed = time(|| black_box(pool.install(|| drive(&px))));
-        let label = format!("parallel ({t} thread{})", if t == 1 { "" } else { "s" });
-        report(&label, elapsed, n, data.len(), Some(baseline));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("gen") => gen_mode(&args[1..]),
+        Some("file") => file_mode(&args[1..]),
+        _ => synthetic_mode(&args),
     }
-
-    fallback_demo();
 }
+
+// --- Shared workload ------------------------------------------------------
 
 /// Parse one record end-to-end and fold its content into a checksum, so the work
 /// (name handling, attribute entity-decode, text) is not optimized away.
@@ -83,16 +61,6 @@ fn workload(rec: &Record) -> u64 {
     acc
 }
 
-/// Run [`workload`] over every record, accumulating into a shared counter.
-fn drive(px: &ParallelXml) -> u64 {
-    let acc = AtomicU64::new(0);
-    px.par_for_each(|rec| {
-        acc.fetch_add(workload(rec), Ordering::Relaxed);
-    })
-    .expect("scan succeeds");
-    acc.load(Ordering::Relaxed)
-}
-
 fn generate(n: usize) -> Vec<u8> {
     let mut s = String::with_capacity(n * 96 + 32);
     s.push_str("<trades>\n");
@@ -110,7 +78,46 @@ fn generate(n: usize) -> Vec<u8> {
     s.into_bytes()
 }
 
-/// Force the parallel path regardless of input size.
+// --- In-memory synthetic mode ---------------------------------------------
+
+fn synthetic_mode(args: &[String]) {
+    let n: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(200_000);
+    let threads: Vec<usize> = match args.get(1) {
+        Some(list) => list.split(',').filter_map(|t| t.parse().ok()).collect(),
+        None => default_thread_counts(),
+    };
+
+    let data = generate(n);
+    println!("document: {n} records, {:.1} MiB\n", data.len() as f64 / MIB);
+
+    black_box(drive(&build(&data, parallel_config())));
+
+    let baseline = time(|| drive(&build(&data, sequential_config())));
+    report("sequential (fallback path)", baseline, n, data.len(), None);
+
+    for &t in &threads {
+        let px = build(&data, parallel_config());
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .expect("thread pool");
+        let elapsed = time(|| black_box(pool.install(|| drive(&px))));
+        let label = format!("parallel ({t} thread{})", if t == 1 { "" } else { "s" });
+        report(&label, elapsed, n, data.len(), Some(baseline));
+    }
+
+    fallback_demo();
+}
+
+fn drive(px: &ParallelXml) -> u64 {
+    let acc = AtomicU64::new(0);
+    px.par_for_each(|rec| {
+        acc.fetch_add(workload(rec), Ordering::Relaxed);
+    })
+    .expect("scan succeeds");
+    acc.load(Ordering::Relaxed)
+}
+
 fn parallel_config() -> Config {
     Config {
         parallel_threshold: 0,
@@ -119,7 +126,6 @@ fn parallel_config() -> Config {
     }
 }
 
-/// Force the sequential path (the per-record fallback loop) for the baseline.
 fn sequential_config() -> Config {
     Config {
         parallel_threshold: usize::MAX,
@@ -140,13 +146,11 @@ fn time<T>(f: impl FnOnce() -> T) -> Duration {
 
 fn report(label: &str, elapsed: Duration, records: usize, bytes: usize, baseline: Option<Duration>) {
     let secs = elapsed.as_secs_f64();
-    let mrec_s = records as f64 / secs / 1e6;
-    let mib_s = bytes as f64 / secs / (1usize << 20) as f64;
     print!(
-        "  {label:<26} {:>9.2} ms   {:>6.1} M rec/s   {:>7.0} MiB/s",
+        "  {label:<28} {:>9.2} ms   {:>6.1} M rec/s   {:>7.0} MiB/s",
         secs * 1e3,
-        mrec_s,
-        mib_s,
+        records as f64 / secs / 1e6,
+        bytes as f64 / secs / MIB,
     );
     match baseline {
         Some(b) => println!("   {:>5.2}x", b.as_secs_f64() / secs),
@@ -154,7 +158,6 @@ fn report(label: &str, elapsed: Duration, records: usize, bytes: usize, baseline
     }
 }
 
-/// Show that a small document transparently takes the sequential path.
 fn fallback_demo() {
     let small = generate(8);
     let cfg = Config::default();
@@ -176,4 +179,96 @@ fn default_thread_counts() -> Vec<usize> {
     let mut counts: Vec<usize> = [1, 2, 4, 8].into_iter().filter(|&t| t < max).collect();
     counts.push(max);
     counts
+}
+
+// --- File modes (zstd) ----------------------------------------------------
+
+#[cfg(feature = "zstd")]
+fn gen_mode(args: &[String]) {
+    let n: usize = args[0].parse().expect("usage: gen <N> <path.zst>");
+    let path = &args[1];
+    let xml = generate(n);
+    let compressed = zstd::encode_all(xml.as_slice(), 3).expect("compress");
+    std::fs::write(path, &compressed).expect("write file");
+    println!(
+        "wrote {path}: {n} records, {:.1} MiB raw -> {:.1} MiB zstd ({:.1}x)",
+        xml.len() as f64 / MIB,
+        compressed.len() as f64 / MIB,
+        xml.len() as f64 / compressed.len() as f64,
+    );
+}
+
+#[cfg(feature = "zstd")]
+fn file_mode(args: &[String]) {
+    use pxml::StreamReader;
+    use std::path::Path;
+
+    let path = Path::new(&args[0]);
+    let raw = std::fs::read(path).expect("read file");
+    let is_zstd = raw.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]);
+    let decompressed_len = if is_zstd {
+        zstd::decode_all(raw.as_slice()).expect("decode").len()
+    } else {
+        raw.len()
+    };
+    println!(
+        "file: {} — {:.1} MiB on disk, {:.1} MiB decompressed\n",
+        path.display(),
+        raw.len() as f64 / MIB,
+        decompressed_len as f64 / MIB,
+    );
+
+    // Resident: from_path decompresses the whole document up front, then parses
+    // it in parallel. Timing includes decompression.
+    let count = AtomicU64::new(0);
+    let resident = time(|| {
+        let acc = AtomicU64::new(0);
+        let doc = ParallelXml::from_path(path)
+            .expect("open")
+            .with_config(parallel_config());
+        doc.par_for_each(|rec| {
+            acc.fetch_add(workload(rec), Ordering::Relaxed);
+            count.fetch_add(1, Ordering::Relaxed);
+        })
+        .expect("parse");
+        black_box(acc.load(Ordering::Relaxed));
+    });
+    let records = count.load(Ordering::Relaxed) as usize;
+    report_file("resident (from_path)", resident, records, decompressed_len);
+
+    if is_zstd {
+        let streaming = time(|| {
+            let acc = AtomicU64::new(0);
+            let reader = StreamReader::from_zstd_reader(std::fs::File::open(path).expect("open"))
+                .expect("zstd reader");
+            reader
+                .par_for_each(|rec| {
+                    acc.fetch_add(workload(rec), Ordering::Relaxed);
+                })
+                .expect("stream");
+            black_box(acc.load(Ordering::Relaxed));
+        });
+        report_file("streaming (from_zstd_reader)", streaming, records, decompressed_len);
+    }
+}
+
+#[cfg(feature = "zstd")]
+fn report_file(label: &str, elapsed: Duration, records: usize, decompressed: usize) {
+    let secs = elapsed.as_secs_f64();
+    println!(
+        "  {label:<30} {:>9.2} ms   {:>6.2} M rec/s   {:>7.0} MiB/s (decompressed)",
+        secs * 1e3,
+        records as f64 / secs / 1e6,
+        decompressed as f64 / secs / MIB,
+    );
+}
+
+#[cfg(not(feature = "zstd"))]
+fn gen_mode(_: &[String]) {
+    eprintln!("`gen` mode requires the `zstd` feature (enabled by default)");
+}
+
+#[cfg(not(feature = "zstd"))]
+fn file_mode(_: &[String]) {
+    eprintln!("`file` mode requires the `zstd` feature (enabled by default)");
 }
