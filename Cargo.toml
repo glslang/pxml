@@ -9,8 +9,5 @@ rayon     = "1"
 memmap2   = "0.9"
 memchr    = "2"
 
-[dev-dependencies]
-criterion = "0.5"  # optional, for examples/bench.rs
-
 [[example]]
 name = "bench"
