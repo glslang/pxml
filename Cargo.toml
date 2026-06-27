@@ -4,11 +4,18 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+default = ["zstd"]
+# Transparent decompression of zstd-compressed documents. Pulls in the
+# C-backed `zstd` crate; disable for a pure-Rust build.
+zstd = ["dep:zstd"]
+
 [dependencies]
 quick-xml = "0.37"
 rayon     = "1"
 memmap2   = "0.9"
 memchr    = "2"
+zstd      = { version = "0.13", optional = true }
 
 [[example]]
 name = "bench"

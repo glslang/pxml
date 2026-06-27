@@ -20,12 +20,14 @@ mod event;
 mod parse;
 mod prelude;
 mod scan;
+mod stream;
 
 pub use config::Config;
 pub use event::{AttrIter, Attribute, Attrs, Event};
 pub use parse::RecordReader;
 pub use prelude::{Encoding, NamespaceContext, Prelude};
 pub use scan::ChunkIndex;
+pub use stream::StreamReader;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -65,13 +67,35 @@ impl Buffer {
     }
 }
 
+/// zstd frame magic number (`0xFD2FB528`, as it appears on the wire). A
+/// well-formed XML document never begins with these bytes, so detection is
+/// unambiguous.
+#[cfg(feature = "zstd")]
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+#[cfg(feature = "zstd")]
+fn is_zstd(bytes: &[u8]) -> bool {
+    bytes.starts_with(&ZSTD_MAGIC)
+}
+
 impl ParallelXml {
     /// Memory-map a file as the document buffer.
+    ///
+    /// With the `zstd` feature (on by default), a zstd-compressed file is
+    /// detected by its magic number and transparently decompressed into memory;
+    /// a plain XML document (which never begins with the zstd magic) is mmap'd
+    /// as before.
     pub fn from_path(p: &Path) -> std::io::Result<Self> {
         let file = std::fs::File::open(p)?;
         // SAFETY: the mapping is read-only; the caller is responsible for not
         // mutating or truncating the file while this `ParallelXml` is alive.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        #[cfg(feature = "zstd")]
+        if is_zstd(&mmap) {
+            let bytes = zstd::decode_all(&mmap[..])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            return Ok(Self::from_owned(bytes));
+        }
         Ok(Self {
             buf: Buffer::Mmap(mmap),
             config: Config::default(),
@@ -82,6 +106,32 @@ impl ParallelXml {
     pub fn from_bytes(b: impl Into<Cow<'static, [u8]>>) -> Self {
         Self {
             buf: Buffer::Owned(b.into()),
+            config: Config::default(),
+        }
+    }
+
+    /// Decompress a zstd-compressed document from a reader into memory.
+    ///
+    /// Because parallel workers need random access to their slices, the whole
+    /// document is decompressed up front. Decompression is sequential and adds
+    /// to the serial fraction (see `DESIGN.md`).
+    #[cfg(feature = "zstd")]
+    pub fn from_zstd_reader(reader: impl std::io::Read) -> Result<Self, XmlError> {
+        let bytes = zstd::decode_all(reader).map_err(XmlError::Io)?;
+        Ok(Self::from_owned(bytes))
+    }
+
+    /// Decompress a zstd-compressed document from an in-memory buffer.
+    #[cfg(feature = "zstd")]
+    pub fn from_zstd_bytes(compressed: &[u8]) -> Result<Self, XmlError> {
+        Self::from_zstd_reader(compressed)
+    }
+
+    /// Wrap an owned, decompressed buffer.
+    #[cfg(feature = "zstd")]
+    fn from_owned(bytes: Vec<u8>) -> Self {
+        Self {
+            buf: Buffer::Owned(Cow::Owned(bytes)),
             config: Config::default(),
         }
     }
@@ -181,6 +231,14 @@ pub struct Record<'doc> {
 }
 
 impl<'doc> Record<'doc> {
+    pub(crate) fn new(bytes: &'doc [u8], prelude: Arc<Prelude>, index: usize) -> Self {
+        Self {
+            bytes,
+            prelude,
+            index,
+        }
+    }
+
     /// A StAX pull cursor over this record's events.
     pub fn events(&self) -> RecordReader<'doc> {
         RecordReader::new(self.bytes, self.prelude.clone(), self.index)
@@ -424,5 +482,46 @@ mod tests {
             }
         }
         assert_eq!(text, "BAR & baz");
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::AtomicUsize;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("pxml-{tag}-{}-{id}.bin", std::process::id()))
+    }
+
+    #[test]
+    fn from_path_reads_plain_xml() {
+        let path = temp_path("plain");
+        std::fs::write(&path, build_doc(40)).unwrap();
+        let doc = ParallelXml::from_path(&path).unwrap();
+        assert_eq!(doc.index().unwrap().len(), 40);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_bytes_roundtrip() {
+        let n = 500;
+        let xml = build_doc(n);
+        let compressed = zstd::encode_all(xml.as_bytes(), 3).unwrap();
+        assert!(compressed.len() < xml.len(), "input should actually compress");
+
+        let doc = ParallelXml::from_zstd_bytes(&compressed).unwrap();
+        let got: Vec<usize> = doc.map_collect(|r| record_text(r).parse().unwrap()).unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn from_path_detects_and_decompresses_zstd() {
+        let n = 120;
+        let compressed = zstd::encode_all(build_doc(n).as_bytes(), 3).unwrap();
+        let path = temp_path("zstd");
+        std::fs::write(&path, &compressed).unwrap();
+        let doc = ParallelXml::from_path(&path).unwrap();
+        assert_eq!(doc.index().unwrap().len(), n);
+        let _ = std::fs::remove_file(&path);
     }
 }

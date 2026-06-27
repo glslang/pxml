@@ -100,6 +100,51 @@ let idx = doc.index()?; // Phase A only
 println!("{} records", idx.len());
 ```
 
+### Compressed input
+
+With the default `zstd` feature, `from_path` transparently decompresses a
+zstd-compressed document (detected by its magic number); plain XML is mmap'd as
+usual. For in-memory or streamed compressed data:
+
+```rust
+use std::fs::File;
+
+let doc = ParallelXml::from_zstd_bytes(&compressed)?;        // &[u8]
+let doc = ParallelXml::from_zstd_reader(File::open(path)?)?; // any Read
+```
+
+The whole document is decompressed up front (workers need random access to
+their slices), so decompression is sequential and adds to the serial fraction.
+Build with `default-features = false` for a pure-Rust crate without the
+C-backed `zstd` dependency.
+
+### Streaming (bounded memory)
+
+`from_path` / `from_bytes` materialize the document — fine for a single file via
+mmap, but a problem for a multi-GB *compressed* file (you can't mmap the
+decompressed form), or for many large files at once. `StreamReader` runs the
+pipeline without holding the whole document: a single producer thread
+decompresses and frames records incrementally, and a `rayon` pool parses them in
+parallel, with a bounded channel providing backpressure. Resident memory is
+bounded by the in-flight records (≈ `threads × record size`) plus one chunk —
+**independent of document size**.
+
+```rust
+use pxml::StreamReader;
+use std::fs::File;
+
+StreamReader::from_zstd_reader(File::open("trades.xml.zst")?)?
+    .par_for_each(|record| {
+        // drive record.events(); results arrive unordered
+    })?;
+```
+
+`from_reader(impl Read)` streams an already-decompressed source. The trade-offs
+vs. the resident path: output is **unordered**, records are **owned** (copied out
+of the decode buffer rather than borrowed), and decompression + framing stay
+sequential — so you exchange zero-copy and document-order collect for constant
+memory.
+
 ## API at a glance
 
 | Type | Purpose |
@@ -108,6 +153,7 @@ println!("{} records", idx.len());
 | `Config` | Tuning: `parallel_threshold`, `min_records`. |
 | `ChunkIndex` | Phase A output: per-record byte ranges + shared `Prelude`. |
 | `Prelude` | Immutable shared context: encoding, root name, namespaces, entities. |
+| `StreamReader` | Bounded-memory streaming pipeline over a `Read` / zstd source. |
 | `Record` | One top-level record; `events()` returns a pull cursor, `index()` its position. |
 | `RecordReader` / `SeqReader` | StAX pull cursors (`next_event()`). |
 | `Event` | `Start { name, attrs }` · `End { name }` · `Text(Cow<str>)` · `Cdata(&[u8])`. |
@@ -171,6 +217,8 @@ throughput and speedup, plus a small-input fallback demonstration.
   raw; comments and PIs are not surfaced as events.
 - **Well-formedness** — depth and root matching are checked in Phase A;
   per-record parse errors carry the record's `index`.
+- **Compressed input** — zstd-compressed documents are transparently
+  decompressed into memory (default `zstd` feature).
 
 ## Limitations
 
@@ -180,9 +228,10 @@ v1, by design (see [`DESIGN.md`](DESIGN.md) for the full non-goals):
   (`QName`, prefix intact). Root-declared namespaces are captured in
   `Prelude::namespaces` for manual resolution, but are not auto-applied per
   event.
-- **Whole document resident.** Parallel workers need random access to their
-  slices, so the document is read into a `Vec` or `mmap`'d. Bounded-memory
-  streaming + parallel is out of scope.
+- **Whole document resident** on the `ParallelXml` path — workers need random
+  access to their slices, so the document is read into a `Vec` or `mmap`'d. Use
+  [`StreamReader`](#streaming-bounded-memory) for bounded-memory parallel
+  parsing (at the cost of unordered, owned records).
 - **No external DTDs / parameter entities**, and no schema/DTD validation.
 - **Sequential Phase A.** The boundary scan is single-threaded (a speculative
   parallel scan is a possible future optimization).
@@ -197,7 +246,12 @@ cargo build
 ```
 
 Built on [`quick-xml`] (Phase B parsing), [`rayon`] (work-stealing pool),
-[`memchr`] (delimiter scanning), and [`memmap2`] (zero-copy file mapping).
+[`memchr`] (delimiter scanning), [`memmap2`] (zero-copy file mapping), and
+[`zstd`] (optional decompression).
+
+```sh
+cargo test --no-default-features   # build/test without the zstd C dependency
+```
 
 ## License
 
@@ -207,3 +261,4 @@ Licensed under the [MIT License](LICENSE).
 [`rayon`]: https://crates.io/crates/rayon
 [`memchr`]: https://crates.io/crates/memchr
 [`memmap2`]: https://crates.io/crates/memmap2
+[`zstd`]: https://crates.io/crates/zstd

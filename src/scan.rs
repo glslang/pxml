@@ -506,6 +506,542 @@ fn pseudo_attr<'b>(decl: &'b [u8], name: &[u8]) -> Option<&'b [u8]> {
     Some(&decl[vstart..vstart + off])
 }
 
+// --- Streaming (incremental) framer ---------------------------------------
+//
+// A resumable variant of Phase A for the streaming pipeline: bytes are fed in
+// chunks, the prolog is parsed once it is fully present, and depth-1 records are
+// emitted as *owned* byte buffers as their boundaries are crossed. The consumed
+// prefix is compacted away so resident memory stays bounded by the largest
+// in-flight record plus a chunk — independent of document size.
+
+/// Result of a successful streaming prolog parse.
+pub(crate) struct PreludeParse {
+    pub prelude: Prelude,
+    pub content_start: usize,
+    pub self_closing: bool,
+}
+
+/// NeedMore-aware prolog + root-tag parse. `Ok(None)` means "feed more bytes";
+/// it is re-run from scratch on the growing buffer until it succeeds.
+pub(crate) fn try_parse_prelude(buf: &[u8]) -> Result<Option<PreludeParse>, XmlError> {
+    const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+    let mut i = 0usize;
+
+    if buf.starts_with(&UTF8_BOM) {
+        i = 3;
+    } else if buf.starts_with(&[0xFF, 0xFE]) || buf.starts_with(&[0xFE, 0xFF]) {
+        return Err(XmlError::Encoding);
+    } else if !buf.is_empty() && UTF8_BOM.starts_with(buf) {
+        return Ok(None); // partial BOM
+    }
+
+    let mut entities: HashMap<Box<str>, Box<str>> = HashMap::new();
+
+    // Optional XML declaration, immediately after any BOM.
+    if buf.len() < i + 2 {
+        return Ok(None);
+    }
+    if buf[i..].starts_with(b"<?xml") {
+        match buf.get(i + 5).copied() {
+            None => return Ok(None),
+            Some(c) if is_xml_ws(c) || c == b'?' => match memmem::find(&buf[i + 2..], b"?>") {
+                Some(off) => {
+                    let decl = &buf[i + 5..i + 2 + off];
+                    if let Some(enc) = pseudo_attr(decl, b"encoding")
+                        && !enc.eq_ignore_ascii_case(b"utf-8")
+                        && !enc.eq_ignore_ascii_case(b"us-ascii")
+                    {
+                        return Err(XmlError::Encoding);
+                    }
+                    i += 2 + off + 2;
+                }
+                None => return Ok(None),
+            },
+            Some(_) => {} // e.g. "<?xml-stylesheet" — a PI, handled below
+        }
+    } else if b"<?xml".starts_with(&buf[i..]) {
+        return Ok(None); // could still become the declaration
+    }
+
+    loop {
+        skip_ws_at(buf, &mut i);
+        if i >= buf.len() {
+            return Ok(None);
+        }
+        match classify_prolog(&buf[i..])? {
+            None => return Ok(None),
+            Some(Construct::Comment) => match memmem::find(&buf[i + 4..], b"-->") {
+                Some(off) => i += 4 + off + 3,
+                None => return Ok(None),
+            },
+            Some(Construct::Pi) => match memmem::find(&buf[i + 2..], b"?>") {
+                Some(off) => i += 2 + off + 2,
+                None => return Ok(None),
+            },
+            Some(Construct::Doctype) => match find_doctype_end(buf, i)? {
+                Some(end) => {
+                    parse_doctype_entities(&buf[i..end], &mut entities);
+                    i = end;
+                }
+                None => return Ok(None),
+            },
+            Some(Construct::Root) => return try_parse_root_tag(buf, i, entities),
+        }
+    }
+}
+
+enum Construct {
+    Comment,
+    Pi,
+    Doctype,
+    Root,
+}
+
+/// Classify the markup at a prolog `<`. `Ok(None)` => need more bytes to decide.
+fn classify_prolog(rest: &[u8]) -> Result<Option<Construct>, XmlError> {
+    debug_assert_eq!(rest[0], b'<');
+    if rest.len() < 2 {
+        return Ok(None);
+    }
+    match rest[1] {
+        b'?' => Ok(Some(Construct::Pi)),
+        b'!' => {
+            if rest.len() < 4 {
+                return Ok(None);
+            }
+            if rest.starts_with(b"<!--") {
+                Ok(Some(Construct::Comment))
+            } else if rest.len() < 9 {
+                if b"<!DOCTYPE".starts_with(rest) {
+                    Ok(None)
+                } else {
+                    Err(XmlError::Malformed(0))
+                }
+            } else if rest.starts_with(b"<!DOCTYPE") {
+                Ok(Some(Construct::Doctype))
+            } else {
+                Err(XmlError::Malformed(0))
+            }
+        }
+        c if is_name_start(c) => Ok(Some(Construct::Root)),
+        _ => Err(XmlError::Malformed(0)),
+    }
+}
+
+/// NeedMore-aware search for a DOCTYPE's closing `>` (tracking quotes, the
+/// internal subset, and comments). Returns the offset just past `>`.
+fn find_doctype_end(buf: &[u8], start: usize) -> Result<Option<usize>, XmlError> {
+    let n = buf.len();
+    let mut i = start + b"<!DOCTYPE".len();
+    let mut in_subset = false;
+    while i < n {
+        let b = buf[i];
+        if b == b'"' || b == b'\'' {
+            i += 1;
+            match memchr(b, &buf[i..]) {
+                Some(off) => i += off + 1,
+                None => return Ok(None),
+            }
+        } else if buf[i..].starts_with(b"<!--") {
+            let s = i + 4;
+            match memmem::find(&buf[s..], b"-->") {
+                Some(off) => i = s + off + 3,
+                None => return Ok(None),
+            }
+        } else if b == b'<' && buf.len() < i + 4 {
+            return Ok(None); // might be a comment we can't classify yet
+        } else if b == b'[' {
+            in_subset = true;
+            i += 1;
+        } else if b == b']' {
+            in_subset = false;
+            i += 1;
+        } else if b == b'>' && !in_subset {
+            return Ok(Some(i + 1));
+        } else {
+            i += 1;
+        }
+    }
+    Ok(None)
+}
+
+/// NeedMore-aware root start-tag parse: name + xmlns declarations + the `>`.
+fn try_parse_root_tag(
+    buf: &[u8],
+    lt: usize,
+    entities: HashMap<Box<str>, Box<str>>,
+) -> Result<Option<PreludeParse>, XmlError> {
+    let n = buf.len();
+    let mut j = lt + 1;
+    while j < n && is_name_char(buf[j]) {
+        j += 1;
+    }
+    if j >= n {
+        return Ok(None); // name may continue
+    }
+    let name = &buf[lt + 1..j];
+    if name.is_empty() {
+        return Err(XmlError::Malformed(lt));
+    }
+    let root_name: Box<str> = utf8(name)?.into();
+
+    let mut ns = NamespaceContext::new();
+    let mut i = j;
+    loop {
+        skip_ws_at(buf, &mut i);
+        if i >= n {
+            return Ok(None);
+        }
+        match buf[i] {
+            b'>' => {
+                return Ok(Some(make_prelude(root_name, ns, entities, i + 1, false)));
+            }
+            b'/' => {
+                return match buf.get(i + 1) {
+                    None => Ok(None),
+                    Some(b'>') => Ok(Some(make_prelude(root_name, ns, entities, i + 2, true))),
+                    Some(_) => Err(XmlError::Malformed(i)),
+                };
+            }
+            _ => {
+                let astart = i;
+                while i < n && is_name_char(buf[i]) {
+                    i += 1;
+                }
+                if i >= n {
+                    return Ok(None);
+                }
+                let aname = &buf[astart..i];
+                if aname.is_empty() {
+                    return Err(XmlError::Malformed(i));
+                }
+                skip_ws_at(buf, &mut i);
+                if i >= n {
+                    return Ok(None);
+                }
+                if buf[i] != b'=' {
+                    return Err(XmlError::Malformed(i));
+                }
+                i += 1;
+                skip_ws_at(buf, &mut i);
+                if i >= n {
+                    return Ok(None);
+                }
+                let q = buf[i];
+                if q != b'"' && q != b'\'' {
+                    return Err(XmlError::Malformed(i));
+                }
+                i += 1;
+                let vstart = i;
+                let off = match memchr(q, &buf[i..]) {
+                    Some(off) => off,
+                    None => return Ok(None),
+                };
+                let value = &buf[vstart..vstart + off];
+                i = vstart + off + 1;
+                if aname == b"xmlns" {
+                    ns.insert(utf8(b"")?, utf8(value)?);
+                } else if let Some(prefix) = aname.strip_prefix(b"xmlns:") {
+                    ns.insert(utf8(prefix)?, utf8(value)?);
+                }
+            }
+        }
+    }
+}
+
+fn make_prelude(
+    root_name: Box<str>,
+    namespaces: NamespaceContext,
+    entities: HashMap<Box<str>, Box<str>>,
+    content_start: usize,
+    self_closing: bool,
+) -> PreludeParse {
+    PreludeParse {
+        prelude: Prelude {
+            encoding: Encoding::Utf8,
+            root_name,
+            namespaces,
+            entities,
+        },
+        content_start,
+        self_closing,
+    }
+}
+
+/// Lexical state of the resumable content framer.
+#[derive(Clone, Copy)]
+enum Cs {
+    Text,
+    Lt,
+    Bang,
+    BangDash,
+    Comment,
+    CommentDash,
+    CommentDashDash,
+    CdataMatch(u8),
+    Cdata,
+    CdataBracket,
+    CdataBracket2,
+    Pi,
+    PiQ,
+    /// Inside a start/end tag. `quote` is the open quote byte (0 = none);
+    /// `prev_slash` tracks a `/` immediately before a possible `>`.
+    Tag { is_end: bool, quote: u8, prev_slash: bool },
+}
+
+/// Resumable depth-1 record framer. Feed bytes with [`StreamFramer::push`],
+/// pull records with [`StreamFramer::next_record`], and call
+/// [`StreamFramer::compact`] between reads to bound memory.
+pub(crate) struct StreamFramer {
+    carry: Vec<u8>,
+    base: usize,
+    cursor: usize,
+    state: Cs,
+    depth: usize,
+    record_start: Option<usize>,
+    tag_start: usize,
+    next_index: usize,
+    finished: bool,
+}
+
+impl StreamFramer {
+    pub(crate) fn new() -> Self {
+        Self {
+            carry: Vec::new(),
+            base: 0,
+            cursor: 0,
+            state: Cs::Text,
+            depth: 0,
+            record_start: None,
+            tag_start: 0,
+            next_index: 0,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn push(&mut self, chunk: &[u8]) {
+        self.carry.extend_from_slice(chunk);
+    }
+
+    /// Attempt to parse the prolog from the buffered bytes. `Ok(None)` => feed
+    /// more. On success the framer switches to content mode.
+    pub(crate) fn try_prelude(&mut self) -> Result<Option<Arc<Prelude>>, XmlError> {
+        match try_parse_prelude(&self.carry)? {
+            Some(p) => {
+                self.cursor = p.content_start;
+                self.depth = 1;
+                self.state = Cs::Text;
+                if p.self_closing {
+                    self.finished = true;
+                    self.depth = 0;
+                }
+                Ok(Some(Arc::new(p.prelude)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Drop already-consumed bytes so resident memory stays bounded.
+    pub(crate) fn compact(&mut self) {
+        let keep_from = match self.record_start {
+            Some(rs) => rs,
+            None => {
+                if matches!(self.state, Cs::Text) {
+                    self.cursor
+                } else {
+                    self.tag_start
+                }
+            }
+        };
+        let drop = keep_from - self.base;
+        if drop > 0 {
+            self.carry.drain(0..drop);
+            self.base = keep_from;
+        }
+    }
+
+    /// Validate end-of-stream: the root must have closed.
+    pub(crate) fn finish(&self) -> Result<(), XmlError> {
+        if self.finished {
+            Ok(())
+        } else {
+            Err(XmlError::Malformed(self.cursor))
+        }
+    }
+
+    /// Advance the framer over the buffered bytes. Returns the next complete
+    /// record as owned bytes, or `Ok(None)` when more input is needed.
+    pub(crate) fn next_record(&mut self) -> Result<Option<(usize, Box<[u8]>)>, XmlError> {
+        let mut i = self.cursor - self.base;
+        let n = self.carry.len();
+        while i < n && !self.finished {
+            match self.state {
+                Cs::Text => match memchr(b'<', &self.carry[i..]) {
+                    Some(off) => {
+                        self.tag_start = self.base + i + off;
+                        i += off + 1;
+                        self.state = Cs::Lt;
+                    }
+                    None => i = n,
+                },
+                Cs::Lt => {
+                    match self.carry[i] {
+                        b'?' => self.state = Cs::Pi,
+                        b'!' => self.state = Cs::Bang,
+                        b'/' => self.state = Cs::Tag { is_end: true, quote: 0, prev_slash: false },
+                        c if is_name_start(c) => {
+                            self.state = Cs::Tag { is_end: false, quote: 0, prev_slash: false }
+                        }
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::Bang => {
+                    match self.carry[i] {
+                        b'-' => self.state = Cs::BangDash,
+                        b'[' => self.state = Cs::CdataMatch(0),
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::BangDash => {
+                    match self.carry[i] {
+                        b'-' => self.state = Cs::Comment,
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::Comment => {
+                    if self.carry[i] == b'-' {
+                        self.state = Cs::CommentDash;
+                    }
+                    i += 1;
+                }
+                Cs::CommentDash => {
+                    self.state = if self.carry[i] == b'-' {
+                        Cs::CommentDashDash
+                    } else {
+                        Cs::Comment
+                    };
+                    i += 1;
+                }
+                Cs::CommentDashDash => {
+                    match self.carry[i] {
+                        b'>' => self.state = Cs::Text,
+                        b'-' => {}
+                        _ => self.state = Cs::Comment,
+                    }
+                    i += 1;
+                }
+                Cs::CdataMatch(k) => {
+                    const LIT: &[u8] = b"CDATA[";
+                    if self.carry[i] == LIT[k as usize] {
+                        self.state = if k as usize + 1 == LIT.len() {
+                            Cs::Cdata
+                        } else {
+                            Cs::CdataMatch(k + 1)
+                        };
+                        i += 1;
+                    } else {
+                        return Err(XmlError::Malformed(self.base + i));
+                    }
+                }
+                Cs::Cdata => {
+                    if self.carry[i] == b']' {
+                        self.state = Cs::CdataBracket;
+                    }
+                    i += 1;
+                }
+                Cs::CdataBracket => {
+                    self.state = if self.carry[i] == b']' {
+                        Cs::CdataBracket2
+                    } else {
+                        Cs::Cdata
+                    };
+                    i += 1;
+                }
+                Cs::CdataBracket2 => {
+                    match self.carry[i] {
+                        b'>' => self.state = Cs::Text,
+                        b']' => {}
+                        _ => self.state = Cs::Cdata,
+                    }
+                    i += 1;
+                }
+                Cs::Pi => {
+                    if self.carry[i] == b'?' {
+                        self.state = Cs::PiQ;
+                    }
+                    i += 1;
+                }
+                Cs::PiQ => {
+                    match self.carry[i] {
+                        b'>' => self.state = Cs::Text,
+                        b'?' => {}
+                        _ => self.state = Cs::Pi,
+                    }
+                    i += 1;
+                }
+                Cs::Tag { is_end, quote, prev_slash } => {
+                    let b = self.carry[i];
+                    if quote != 0 {
+                        if b == quote {
+                            self.state = Cs::Tag { is_end, quote: 0, prev_slash };
+                        }
+                        i += 1;
+                    } else if b == b'"' || b == b'\'' {
+                        self.state = Cs::Tag { is_end, quote: b, prev_slash: false };
+                        i += 1;
+                    } else if b == b'>' {
+                        let end = self.base + i + 1;
+                        i += 1;
+                        self.state = Cs::Text;
+                        if is_end {
+                            self.depth =
+                                self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
+                            if self.depth == 0 {
+                                self.finished = true;
+                            } else if self.depth == 1 {
+                                let start =
+                                    self.record_start.take().ok_or(XmlError::Malformed(end))?;
+                                self.cursor = end;
+                                return Ok(Some(self.emit(start, end)));
+                            }
+                        } else if prev_slash {
+                            if self.depth == 1 {
+                                self.cursor = end;
+                                return Ok(Some(self.emit(self.tag_start, end)));
+                            }
+                        } else if self.depth == 1 {
+                            self.record_start = Some(self.tag_start);
+                            self.depth = 2;
+                        } else {
+                            self.depth += 1;
+                        }
+                    } else if b == b'/' {
+                        self.state = Cs::Tag { is_end, quote: 0, prev_slash: true };
+                        i += 1;
+                    } else {
+                        self.state = Cs::Tag { is_end, quote: 0, prev_slash: false };
+                        i += 1;
+                    }
+                }
+            }
+        }
+        self.cursor = self.base + i;
+        Ok(None)
+    }
+
+    fn emit(&mut self, start: usize, end: usize) -> (usize, Box<[u8]>) {
+        let bytes = self.carry[start - self.base..end - self.base]
+            .to_vec()
+            .into_boxed_slice();
+        let index = self.next_index;
+        self.next_index += 1;
+        (index, bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +1188,83 @@ mod tests {
         assert!(scan(b"<r><a></r>").is_err(), "mismatched / root consumed by child");
         assert!(scan(b"<r></r>trailing").is_err(), "junk after root");
         assert!(scan(b"<r/>x").is_err(), "junk after self-closing root");
+    }
+
+    /// Record byte-ranges per the materialized scanner, as strings.
+    fn materialized(input: &[u8]) -> Vec<String> {
+        let idx = scan(input).unwrap();
+        idx.records()
+            .iter()
+            .map(|r| String::from_utf8(input[r.clone()].to_vec()).unwrap())
+            .collect()
+    }
+
+    /// Drive the streaming framer feeding `chunk` bytes at a time.
+    fn stream_frame(input: &[u8], chunk: usize) -> Vec<String> {
+        let mut framer = StreamFramer::new();
+        let mut fed = 0;
+        loop {
+            if framer.try_prelude().unwrap().is_some() {
+                break;
+            }
+            assert!(fed < input.len(), "exhausted input before prolog completed");
+            let end = (fed + chunk).min(input.len());
+            framer.push(&input[fed..end]);
+            fed = end;
+        }
+        let mut out = Vec::new();
+        loop {
+            while let Some((_index, bytes)) = framer.next_record().unwrap() {
+                out.push(String::from_utf8(bytes.to_vec()).unwrap());
+            }
+            framer.compact();
+            if fed >= input.len() {
+                framer.finish().unwrap();
+                break;
+            }
+            let end = (fed + chunk).min(input.len());
+            framer.push(&input[fed..end]);
+            fed = end;
+        }
+        out
+    }
+
+    #[test]
+    fn streaming_framer_matches_materialized() {
+        let inputs: &[&[u8]] = &[
+            b"<trades><trade>a</trade><trade>b</trade></trades>",
+            b"<r>\n  <a/>\n  <b>x</b>\n</r>",
+            b"<r><a x=\"1 > 0\"/></r>",
+            b"<r><!-- <a/> --><a>1</a><![CDATA[</a><b>]]></r>",
+            b"<?xml version=\"1.0\"?><?pi data?><r><?pi?><a/></r>",
+            b"<!DOCTYPE r [ <!ENTITY foo \"bar\"> ]><r><a>&foo;</a></r>",
+            b"<r id=\"root\"><a><b/><c>x</c></a></r>",
+            b"<r/>",
+            b"<r></r>",
+        ];
+        for input in inputs {
+            let expected = materialized(input);
+            for &chunk in &[1usize, 2, 3, 5, 7, 13, 1000] {
+                let got = stream_frame(input, chunk);
+                assert_eq!(
+                    got,
+                    expected,
+                    "input={:?} chunk={chunk}",
+                    std::str::from_utf8(input).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_framer_indices_are_sequential() {
+        let mut framer = StreamFramer::new();
+        framer.push(b"<r><a/><b/><c/></r>");
+        assert!(framer.try_prelude().unwrap().is_some());
+        let mut indices = Vec::new();
+        while let Some((index, _)) = framer.next_record().unwrap() {
+            indices.push(index);
+        }
+        assert_eq!(indices, vec![0, 1, 2]);
     }
 }
