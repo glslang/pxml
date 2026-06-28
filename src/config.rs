@@ -1,4 +1,4 @@
-//! Configuration: parallelism thresholds and event filtering.
+//! Configuration: parallelism thresholds.
 
 /// Tuning knobs for parsing. Construct with [`Config::default`] and override
 /// fields, then pass to [`ParallelXml::with_config`](crate::ParallelXml::with_config).
@@ -11,10 +11,6 @@ pub struct Config {
     /// Below this record count, parsing transparently falls back to a sequential
     /// pass for the same reason.
     pub min_records: usize,
-    /// Surface comment (`<!-- … -->`) events to consumers.
-    pub emit_comments: bool,
-    /// Surface processing-instruction (`<? … ?>`) events to consumers.
-    pub emit_pis: bool,
 }
 
 impl Default for Config {
@@ -22,8 +18,6 @@ impl Default for Config {
         Self {
             parallel_threshold: 4 * 1024 * 1024, // ~4 MiB
             min_records: 64,
-            emit_comments: false,
-            emit_pis: false,
         }
     }
 }

@@ -75,19 +75,19 @@ impl<'a> Scanner<'a> {
 
         // Cursor is now at the root start tag's '<'.
         let (root_name, namespaces, self_closing) = self.parse_root()?;
+
+        let mut records = Vec::new();
+        if !self_closing {
+            self.scan_content(&mut records, root_name.as_bytes())?;
+        }
+        self.skip_trailing_misc()?;
+
         let prelude = Arc::new(Prelude {
             encoding,
             root_name,
             namespaces,
             entities,
         });
-
-        let mut records = Vec::new();
-        if !self_closing {
-            self.scan_content(&mut records)?;
-        }
-        self.skip_trailing_misc()?;
-
         Ok(ChunkIndex { prelude, records })
     }
 
@@ -144,8 +144,10 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Parse a DOCTYPE, capturing internal-subset `<!ENTITY>` definitions.
-    /// External DTDs / parameter entities are skipped (out of scope for v1).
+    /// Parse a DOCTYPE, capturing internal-subset `<!ENTITY>` definitions. An
+    /// external DTD (`SYSTEM`/`PUBLIC`) is rejected with
+    /// [`XmlError::UnsupportedDtd`] rather than silently skipped, since we can't
+    /// resolve the global entities it may declare.
     fn parse_doctype(&mut self, entities: &mut HashMap<Box<str>, Box<str>>) -> Result<(), XmlError> {
         let n = self.buf.len();
         let mut i = self.pos + b"<!DOCTYPE".len();
@@ -160,6 +162,10 @@ impl<'a> Scanner<'a> {
                 let start = i + 4;
                 let off = memmem::find(&self.buf[start..], b"-->").ok_or(XmlError::Malformed(i))?;
                 i = start + off + 3;
+            } else if !in_subset
+                && (self.buf[i..].starts_with(b"SYSTEM") || self.buf[i..].starts_with(b"PUBLIC"))
+            {
+                return Err(XmlError::UnsupportedDtd); // external DTD
             } else if in_subset && self.buf[i..].starts_with(b"<!ENTITY") {
                 i = parse_entity_decl(self.buf, i, entities)?;
             } else if b == b'[' {
@@ -262,7 +268,11 @@ impl<'a> Scanner<'a> {
 
     /// Frame depth-1 records, starting with the cursor just past the root start
     /// tag (`depth == 1`). Returns with the cursor just past the root end tag.
-    fn scan_content(&mut self, records: &mut Vec<Range<usize>>) -> Result<(), XmlError> {
+    fn scan_content(
+        &mut self,
+        records: &mut Vec<Range<usize>>,
+        root_name: &[u8],
+    ) -> Result<(), XmlError> {
         let mut depth: usize = 1;
         let mut record_start: Option<usize> = None;
 
@@ -271,6 +281,10 @@ impl<'a> Scanner<'a> {
                 Some(off) => self.pos + off,
                 None => return Err(XmlError::Malformed(self.pos)), // EOF before root close
             };
+            // Only whitespace is allowed directly under the root, between records.
+            if depth == 1 && !self.buf[self.pos..lt].iter().all(|&b| is_xml_ws(b)) {
+                return Err(XmlError::Malformed(self.pos));
+            }
             self.pos = lt;
             let rest = &self.buf[lt..];
 
@@ -284,8 +298,9 @@ impl<'a> Scanner<'a> {
                 let end = self.scan_tag_end(lt + 2)?;
                 depth = depth.checked_sub(1).ok_or(XmlError::Malformed(lt))?;
                 if depth == 0 {
-                    // Root end tag. A record left open here is malformed.
-                    if record_start.is_some() {
+                    // Root end tag. A record left open, or a name that doesn't
+                    // match the root start tag, is malformed.
+                    if record_start.is_some() || end_tag_name(self.buf, lt + 2) != root_name {
                         return Err(XmlError::Malformed(lt));
                     }
                     self.pos = end;
@@ -397,6 +412,15 @@ fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-' | b'.') || b >= 0x80
 }
 
+/// The name of an end tag, given the offset just past `</`.
+fn end_tag_name(buf: &[u8], start: usize) -> &[u8] {
+    let mut j = start;
+    while j < buf.len() && is_name_char(buf[j]) {
+        j += 1;
+    }
+    &buf[start..j]
+}
+
 fn is_xml_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
@@ -422,9 +446,11 @@ pub(crate) fn parse_doctype_entities(body: &[u8], out: &mut HashMap<Box<str>, Bo
     }
 }
 
-/// Parse one `<!ENTITY …>` declaration starting at `i`; capture general internal
-/// entities (`<!ENTITY name "value">`) and skip parameter/external ones. Returns
-/// the offset just past the declaration's `>`.
+/// Parse one `<!ENTITY …>` declaration starting at `i`, capturing general
+/// internal entities (`<!ENTITY name "value">`). Parameter entities
+/// (`<!ENTITY % …>`) and external entities (`SYSTEM`/`PUBLIC`) are unsupported
+/// and rejected with [`XmlError::UnsupportedDtd`] rather than silently skipped.
+/// Returns the offset just past the declaration's `>`.
 fn parse_entity_decl(
     buf: &[u8],
     i: usize,
@@ -434,9 +460,9 @@ fn parse_entity_decl(
     let mut j = i + b"<!ENTITY".len();
     skip_ws_at(buf, &mut j);
 
-    // Parameter entity (`<!ENTITY % …>`) — out of scope.
+    // Parameter entity (`<!ENTITY % …>`) — unsupported.
     if j < n && buf[j] == b'%' {
-        return skip_decl_to_gt(buf, i);
+        return Err(XmlError::UnsupportedDtd);
     }
 
     let name_start = j;
@@ -449,8 +475,8 @@ fn parse_entity_decl(
     }
     skip_ws_at(buf, &mut j);
 
-    // Internal entity: a quoted replacement value. Anything else (SYSTEM /
-    // PUBLIC) is external — skip without capturing.
+    // Internal entity: a quoted replacement value. Anything else (`SYSTEM` /
+    // `PUBLIC`) is an external entity, which we don't resolve.
     if j < n && (buf[j] == b'"' || buf[j] == b'\'') {
         let q = buf[j];
         j += 1;
@@ -460,7 +486,7 @@ fn parse_entity_decl(
         entities.insert(utf8(name)?.into(), utf8(value)?.into());
         skip_decl_to_gt(buf, j)
     } else {
-        skip_decl_to_gt(buf, i)
+        Err(XmlError::UnsupportedDtd)
     }
 }
 
@@ -824,6 +850,7 @@ pub(crate) struct StreamFramer {
     tag_start: usize,
     next_index: usize,
     finished: bool,
+    root_name: Box<str>,
 }
 
 impl StreamFramer {
@@ -838,6 +865,7 @@ impl StreamFramer {
             tag_start: 0,
             next_index: 0,
             finished: false,
+            root_name: Box::default(),
         }
     }
 
@@ -857,6 +885,7 @@ impl StreamFramer {
                     self.finished = true;
                     self.depth = 0;
                 }
+                self.root_name = p.prelude.root_name.clone();
                 Ok(Some(Arc::new(p.prelude)))
             }
             None => Ok(None),
@@ -909,6 +938,11 @@ impl StreamFramer {
         matches!(self.state, Cs::Comment | Cs::Cdata | Cs::Pi)
     }
 
+    /// Whether the end tag currently at `tag_start` names the root element.
+    fn root_close_ok(&self) -> bool {
+        end_tag_name(&self.carry, self.tag_start - self.base + 2) == self.root_name.as_bytes()
+    }
+
     /// Validate end-of-stream: the root must have closed.
     pub(crate) fn finish(&self) -> Result<(), XmlError> {
         if self.finished {
@@ -934,11 +968,21 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
+                        if self.depth == 1
+                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        {
+                            return Err(XmlError::Malformed(self.base + i));
+                        }
                         self.tag_start = self.base + i + off;
                         i += off + 1;
                         self.state = Cs::Lt;
                     }
-                    None => i = n,
+                    None => {
+                        if self.depth == 1 && !self.carry[i..].iter().all(|&b| is_xml_ws(b)) {
+                            return Err(XmlError::Malformed(self.base + i));
+                        }
+                        i = n;
+                    }
                 },
                 Cs::Lt => {
                     match self.carry[i] {
@@ -1056,6 +1100,9 @@ impl StreamFramer {
                             self.depth =
                                 self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
                             if self.depth == 0 {
+                                if !self.root_close_ok() {
+                                    return Err(XmlError::Malformed(end));
+                                }
                                 self.finished = true;
                             } else if self.depth == 1 {
                                 let start =
@@ -1104,11 +1151,21 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
+                        if self.depth == 1
+                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        {
+                            return Err(XmlError::Malformed(self.base + i));
+                        }
                         self.tag_start = self.base + i + off;
                         i += off + 1;
                         self.state = Cs::Lt;
                     }
-                    None => i = n,
+                    None => {
+                        if self.depth == 1 && !self.carry[i..].iter().all(|&b| is_xml_ws(b)) {
+                            return Err(XmlError::Malformed(self.base + i));
+                        }
+                        i = n;
+                    }
                 },
                 Cs::Lt => {
                     match self.carry[i] {
@@ -1207,6 +1264,9 @@ impl StreamFramer {
                     if is_end {
                         self.depth = self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
                         if self.depth == 0 {
+                            if !self.root_close_ok() {
+                                return Err(XmlError::Malformed(end));
+                            }
                             self.finished = true;
                         } else if self.depth == 1 {
                             let start = self.record_start.take().ok_or(XmlError::Malformed(end))?;
@@ -1358,22 +1418,39 @@ mod tests {
     }
 
     #[test]
-    fn internal_entities_captured_params_and_external_skipped() {
-        let idx = scan(
-            b"<!DOCTYPE r [ <!ENTITY a 'x'> <!ENTITY % p 'y'> <!ENTITY b \"z\"> ]><r/>",
-        )
-        .unwrap();
+    fn internal_entities_captured() {
+        let idx = scan(b"<!DOCTYPE r [ <!ENTITY a 'x'> <!ENTITY b \"z\"> ]><r/>").unwrap();
         let e = &idx.prelude().entities;
         assert_eq!(e.get("a").map(|s| &**s), Some("x"));
         assert_eq!(e.get("b").map(|s| &**s), Some("z"));
-        assert!(e.get("p").is_none(), "parameter entity must be skipped");
     }
 
     #[test]
-    fn doctype_without_subset_is_skipped() {
-        let idx = scan(br#"<!DOCTYPE r SYSTEM "r.dtd"><r><a/></r>"#).unwrap();
-        assert_eq!(idx.len(), 1);
-        assert!(idx.prelude().entities.is_empty());
+    fn parameter_entity_is_rejected() {
+        assert!(matches!(
+            scan(b"<!DOCTYPE r [ <!ENTITY % p 'y'> ]><r/>"),
+            Err(XmlError::UnsupportedDtd)
+        ));
+    }
+
+    #[test]
+    fn external_entity_is_rejected() {
+        assert!(matches!(
+            scan(br#"<!DOCTYPE r [ <!ENTITY ext SYSTEM "ext.ent"> ]><r/>"#),
+            Err(XmlError::UnsupportedDtd)
+        ));
+    }
+
+    #[test]
+    fn external_dtd_is_rejected() {
+        assert!(matches!(
+            scan(br#"<!DOCTYPE r SYSTEM "r.dtd"><r><a/></r>"#),
+            Err(XmlError::UnsupportedDtd)
+        ));
+        assert!(matches!(
+            scan(br#"<!DOCTYPE r PUBLIC "-//x//DTD//EN" "r.dtd"><r/>"#),
+            Err(XmlError::UnsupportedDtd)
+        ));
     }
 
     #[test]
@@ -1402,6 +1479,24 @@ mod tests {
         assert!(scan(b"<r><a></r>").is_err(), "mismatched / root consumed by child");
         assert!(scan(b"<r></r>trailing").is_err(), "junk after root");
         assert!(scan(b"<r/>x").is_err(), "junk after self-closing root");
+    }
+
+    #[test]
+    fn mismatched_root_close_is_rejected() {
+        assert!(scan(b"<r><a/></x>").is_err(), "root close name mismatch");
+        assert!(
+            scan(b"<trades><trade/></trade>").is_err(),
+            "root close matches record name, not root"
+        );
+        assert!(scan(b"<r><a/></r>").is_ok(), "matching root close is fine");
+    }
+
+    #[test]
+    fn non_whitespace_text_under_root_is_rejected() {
+        assert!(scan(b"<r>junk<a/></r>").is_err(), "text before first record");
+        assert!(scan(b"<r><a/>junk<b/></r>").is_err(), "text between records");
+        assert!(scan(b"<r><a/>junk</r>").is_err(), "text after last record");
+        assert!(scan(b"<r> \n\t <a/> \r\n </r>").is_ok(), "whitespace is allowed");
     }
 
     /// Record byte-ranges per the materialized scanner, as strings.
@@ -1482,6 +1577,31 @@ mod tests {
             indices.push(index);
         }
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    /// Drive the streaming framer over a whole input; return the first error
+    /// (framing or end-of-stream).
+    fn stream_result(input: &[u8]) -> Result<(), XmlError> {
+        let mut f = StreamFramer::new();
+        f.push(input);
+        if f.try_prelude()?.is_none() {
+            return Err(XmlError::Malformed(0));
+        }
+        let mut arena = Vec::new();
+        loop {
+            match f.next_record_into(&mut arena)? {
+                Some(_) => {}
+                None => return f.finish(),
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_framer_enforces_well_formedness() {
+        assert!(stream_result(b"<r><a/></x>").is_err(), "mismatched root close");
+        assert!(stream_result(b"<r>junk<a/></r>").is_err(), "text before record");
+        assert!(stream_result(b"<r><a/>junk</r>").is_err(), "text after record");
+        assert!(stream_result(b"<r> <a/> </r>").is_ok(), "whitespace is allowed");
     }
 
     #[test]

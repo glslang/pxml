@@ -128,16 +128,22 @@ reused (with a lazily-filled entity map) by the streaming and sequential readers
 ## 7. Entity resolution: predefined + internal subset only
 
 **Decision.** Resolve the five predefined XML entities plus internal-subset
-`<!ENTITY name "value">` definitions, via `quick-xml`'s `unescape_with`. Skip
-parameter entities (`<!ENTITY % …>`) and external/SYSTEM/PUBLIC entities.
+`<!ENTITY name "value">` definitions, via `quick-xml`'s `unescape_with`. The
+materialized `scan()` **rejects** parameter entities (`<!ENTITY % …>`), external
+entities (`SYSTEM`/`PUBLIC`), and external DTDs with `XmlError::UnsupportedDtd`
+rather than silently skipping them (issue #3) — silently skipping risks
+partially interpreting a document that depends on unsupported global entities.
+The streaming/`SeqReader` DOCTYPE parse stays best-effort (it captures what it
+can and ignores the rest).
 
 **Why.** External DTD resolution is out of scope (and `quick-xml` doesn't do it
 either). Predefined-first precedence keeps the reserved entities reserved. The
 lookup is shared (`Prelude::resolve_entity`) across text and attribute decoding
 and across all three reader types.
 
-**Consequences.** Documents relying on external DTDs won't expand those entities.
-Internal `<!ENTITY>` and the predefined set work everywhere.
+**Consequences.** A document that declares external/parameter entities fails fast
+on the resident path instead of being half-interpreted. Internal `<!ENTITY>` and
+the predefined set work everywhere.
 
 ---
 
