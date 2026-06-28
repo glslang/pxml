@@ -645,16 +645,16 @@ fn classify_prolog(rest: &[u8], offset: usize) -> Result<Option<Construct>, XmlE
                 if b"<!DOCTYPE".starts_with(rest) {
                     Ok(None)
                 } else {
-                    Err(XmlError::Malformed(0))
+                    Err(XmlError::Malformed(offset))
                 }
             } else if rest.starts_with(b"<!DOCTYPE") {
                 Ok(Some(Construct::Doctype))
             } else {
-                Err(XmlError::Malformed(0))
+                Err(XmlError::Malformed(offset))
             }
         }
         c if is_name_start(c) => Ok(Some(Construct::Root)),
-        _ => Err(XmlError::Malformed(0)),
+        _ => Err(XmlError::Malformed(offset)),
     }
 }
 
