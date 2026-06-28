@@ -224,12 +224,18 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
   shared `Prelude` (see Limitations for how they're surfaced).
 - **Entities** — internal-subset `<!ENTITY>` definitions are captured in Phase A
   and resolved (alongside the predefined XML entities) when decoding text and
-  attribute values.
+  attribute values. External DTDs and parameter entities are **rejected** with
+  `XmlError::UnsupportedDtd` rather than silently skipped.
 - **Comments, CDATA, PIs** — correctly skipped during framing, so
   record-lookalike text inside them never mis-frames a record. CDATA is surfaced
   raw; comments and PIs are not surfaced as events.
-- **Well-formedness** — depth and root matching are checked in Phase A;
-  per-record parse errors carry the record's `index`.
+- **Well-formedness** — Phase A checks depth, that the root end tag's name
+  matches the root, and that only whitespace appears directly under the root
+  (non-whitespace text between records is rejected). Nested-element name matching
+  is delegated to the per-record `quick-xml` parse; per-record parse errors carry
+  the record's `index`.
+- **Fallible record work** — `try_par_for_each` / `try_map_collect` take closures
+  returning `Result`, surfacing failures as `XmlError::RecordError { index, .. }`.
 - **Compressed input** — zstd-compressed documents are transparently
   decompressed into memory (default `zstd` feature).
 

@@ -210,6 +210,75 @@ impl ParallelXml {
         Ok(out)
     }
 
+    /// Like [`par_for_each`](Self::par_for_each), but the closure returns a
+    /// `Result`. A record failure is wrapped as
+    /// [`XmlError::RecordError`]`{ index, source }`; the call short-circuits on
+    /// the first error (in completion order).
+    pub fn try_par_for_each<F, E>(&self, f: F) -> Result<(), XmlError>
+    where
+        F: Fn(&Record) -> Result<(), E> + Sync,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let buf = self.buf.as_slice();
+        let index = scan::scan(buf)?;
+        let prelude = &index.prelude;
+        let one = |i: usize, r: &Range<usize>| {
+            let rec = Record {
+                bytes: &buf[r.clone()],
+                prelude: prelude.clone(),
+                index: i,
+            };
+            f(&rec).map_err(|e| XmlError::RecordError {
+                index: i,
+                source: e.into(),
+            })
+        };
+        if self.run_sequential(buf.len(), index.records.len()) {
+            index.records.iter().enumerate().try_for_each(|(i, r)| one(i, r))
+        } else {
+            index
+                .records
+                .par_iter()
+                .enumerate()
+                .try_for_each(|(i, r)| one(i, r))
+        }
+    }
+
+    /// Like [`map_collect`](Self::map_collect), but the closure returns a
+    /// `Result`. On success the output is in document order; on failure the call
+    /// short-circuits, returning the first [`XmlError::RecordError`].
+    pub fn try_map_collect<T, F, E>(&self, f: F) -> Result<Vec<T>, XmlError>
+    where
+        T: Send,
+        F: Fn(&Record) -> Result<T, E> + Sync,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let buf = self.buf.as_slice();
+        let index = scan::scan(buf)?;
+        let prelude = &index.prelude;
+        let one = |i: usize, r: &Range<usize>| {
+            let rec = Record {
+                bytes: &buf[r.clone()],
+                prelude: prelude.clone(),
+                index: i,
+            };
+            f(&rec).map_err(|e| XmlError::RecordError {
+                index: i,
+                source: e.into(),
+            })
+        };
+        if self.run_sequential(buf.len(), index.records.len()) {
+            index.records.iter().enumerate().map(|(i, r)| one(i, r)).collect()
+        } else {
+            index
+                .records
+                .par_iter()
+                .enumerate()
+                .map(|(i, r)| one(i, r))
+                .collect()
+        }
+    }
+
     /// Whether to take the sequential path: small buffers or few records don't
     /// repay the thread-pool + indexing overhead (see [`Config`]).
     fn run_sequential(&self, byte_len: usize, record_count: usize) -> bool {
@@ -438,6 +507,32 @@ mod tests {
     fn map_collect_reports_scan_error() {
         let px = ParallelXml::from_bytes(&b"<r><a></r>"[..]);
         assert!(px.map_collect(|_| ()).is_err());
+    }
+
+    #[test]
+    fn try_map_collect_ok_preserves_order() {
+        let n = 300;
+        let px = ParallelXml::from_bytes(build_doc(n).into_bytes()).with_config(force_parallel());
+        let got: Vec<usize> = px
+            .try_map_collect(|rec| record_text(rec).parse::<usize>())
+            .unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn try_map_collect_propagates_record_error() {
+        let xml = "<records><r>0</r><r>NaN</r><r>2</r></records>";
+        let px = ParallelXml::from_bytes(xml.as_bytes().to_vec()).with_config(force_parallel());
+        let res = px.try_map_collect(|rec| record_text(rec).parse::<usize>());
+        assert!(matches!(res, Err(XmlError::RecordError { index: 1, .. })));
+    }
+
+    #[test]
+    fn try_par_for_each_surfaces_record_error() {
+        let xml = "<records><r>0</r><r>oops</r></records>";
+        let px = ParallelXml::from_bytes(xml.as_bytes().to_vec());
+        let res = px.try_par_for_each(|rec| record_text(rec).parse::<usize>().map(|_| ()));
+        assert!(matches!(res, Err(XmlError::RecordError { index: 1, .. })));
     }
 
     #[test]
