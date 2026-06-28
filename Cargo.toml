@@ -9,6 +9,11 @@ default = ["zstd"]
 # Transparent decompression of zstd-compressed documents. Pulls in the
 # C-backed `zstd` crate; disable for a pure-Rust build.
 zstd = ["dep:zstd"]
+# Opt-in: drive the streaming framer's comment/CDATA/PI/tag scans with
+# memchr/memmem instead of the default byte-by-byte state machine. Marginal
+# (slightly slower) on many-small-record workloads, but can help documents with
+# large text/CDATA spans. See DECISIONS.md.
+memchr-framer = []
 
 [dependencies]
 quick-xml = "0.37"

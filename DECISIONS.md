@@ -361,11 +361,38 @@ advantage shrinks, and the single sequential producer remains the ceiling.
 
 ---
 
+## 16. memchr/memmem streaming framer (feature-gated)
+
+**Context.** The streaming framer scans content byte-by-byte (only the text→`<`
+hop used `memchr`). A natural optimization: drive the comment/CDATA/PI terminator
+scans with `memmem` and the tag-interior scan with `memchr3`, skipping
+name/attribute/whitespace bytes in bulk.
+
+**Decision.** Implemented behind an opt-in `memchr-framer` Cargo feature (default
+off); the byte-by-byte framer stays the default.
+
+**Why not default.** On the 2M-record file it measured **~5% slower** (~400 ms vs
+~380 ms): the records are many tiny tags, where `memchr`'s per-call setup doesn't
+beat a short byte loop, and after batching (14) the producer is no longer the sole
+bottleneck. It can still help documents with large text/CDATA spans (big bulk
+skips), so it's kept available rather than dropped. Both framers share the struct,
+prelude parse, compaction and emit; only the state enum and the content loop
+differ under `cfg`, and both pass the same chunk-size parity tests (1…1000).
+
+**Bug worth noting.** The first cut had `memmem::find`'s arguments swapped
+(`find(haystack, needle)`), so terminators were searched for *inside* the 3-byte
+needle and never matched — the comment/CDATA never terminated. Caught by the
+chunk-size parity test (chunk=2 on a comment+CDATA input), which is exactly why
+that test sweeps many chunk sizes.
+
+---
+
 ## Future work
 
-- **Reduce streaming overhead further.** Batching + arena are done (15). A
-  `memchr`-driven streaming framer (the content scan is still byte-by-byte) and a
-  tunable `B` would chip at the remaining producer cost.
+- **Reduce streaming overhead further.** Batching + arena are done (15); a
+  `memchr` framer is available behind `memchr-framer` but marginal on small
+  records (16). A tunable batch size `B` and a faster prelude parse are the
+  remaining producer-side knobs.
 - **Parallel decompression / parallel Phase A.** The single sequential producer is
   now the ceiling. zstd multi-frame decode or a speculative chunk-and-verify scan
   would attack the remaining serial fraction.
