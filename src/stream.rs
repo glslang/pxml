@@ -14,6 +14,7 @@
 //! the achievable speedup (Amdahl).
 
 use std::io::Read;
+use std::ops::Range;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
@@ -24,6 +25,18 @@ use crate::{Record, XmlError};
 
 /// Bytes pulled from the source per read.
 const CHUNK: usize = 64 * 1024;
+
+/// Records carried per channel message. Batching amortizes the channel send and
+/// the `par_bridge` receiver mutex over many records, and packs a batch's record
+/// bytes into a single arena allocation (one alloc per batch, not per record).
+const BATCH: usize = 256;
+
+/// A batch of framed records sharing one arena allocation. `records` holds each
+/// record's document index and its byte span within `data`.
+struct Batch {
+    data: Vec<u8>,
+    records: Vec<(usize, Range<usize>)>,
+}
 
 /// A streaming, bounded-memory parser over a (decompressing) byte source.
 ///
@@ -79,32 +92,47 @@ impl<'a> StreamReader<'a> {
         };
 
         let capacity = (rayon::current_num_threads() * 2).max(1);
-        let (tx, rx) = sync_channel::<(usize, Box<[u8]>)>(capacity);
+        let (tx, rx) = sync_channel::<Batch>(capacity);
 
         thread::scope(|scope| {
             let producer = scope.spawn(move || -> Result<(), XmlError> {
                 let mut chunk = vec![0u8; CHUNK];
                 loop {
-                    while let Some(record) = framer.next_record()? {
-                        if tx.send(record).is_err() {
-                            return Ok(()); // consumer dropped
+                    // Pack up to BATCH records into one arena allocation.
+                    let mut data = Vec::new();
+                    let mut records = Vec::with_capacity(BATCH);
+                    let mut need_more = false;
+                    while records.len() < BATCH {
+                        match framer.next_record_into(&mut data)? {
+                            Some(record) => records.push(record),
+                            None => {
+                                need_more = true;
+                                break;
+                            }
                         }
                     }
-                    framer.compact();
-                    let n = reader.read(&mut chunk).map_err(XmlError::Io)?;
-                    if n == 0 {
-                        framer.finish()?;
-                        return Ok(());
+                    if !records.is_empty() && tx.send(Batch { data, records }).is_err() {
+                        return Ok(()); // consumer dropped
                     }
-                    framer.push(&chunk[..n]);
+                    if need_more {
+                        framer.compact();
+                        let n = reader.read(&mut chunk).map_err(XmlError::Io)?;
+                        if n == 0 {
+                            framer.finish()?;
+                            return Ok(());
+                        }
+                        framer.push(&chunk[..n]);
+                    }
                 }
             });
 
-            // Workers pull framed records and parse them in parallel. The bounded
-            // channel throttles the producer when the pool is saturated.
-            rx.into_iter().par_bridge().for_each(|(index, bytes)| {
-                let record = Record::new(&bytes, prelude.clone(), index);
-                f(&record);
+            // Workers pull whole batches and parse their records in parallel. The
+            // bounded channel throttles the producer when the pool is saturated.
+            rx.into_iter().par_bridge().for_each(|batch| {
+                for (index, span) in &batch.records {
+                    let record = Record::new(&batch.data[span.clone()], prelude.clone(), *index);
+                    f(&record);
+                }
             });
 
             producer.join().expect("producer thread panicked")

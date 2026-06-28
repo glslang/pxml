@@ -141,11 +141,15 @@ StreamReader::from_zstd_reader(File::open("trades.xml.zst")?)?
     })?;
 ```
 
-`from_reader(impl Read)` streams an already-decompressed source. The trade-offs
-vs. the resident path: output is **unordered**, records are **owned** (copied out
-of the decode buffer rather than borrowed), and decompression + framing stay
-sequential — so you exchange zero-copy and document-order collect for constant
-memory.
+`from_reader(impl Read)` streams an already-decompressed source. Records are
+framed and parsed in batches (one arena allocation each), which keeps the
+producer→worker handoff cheap. The trade-offs vs. the resident path: output is
+**unordered** and records are **owned** (copied out of the decode buffer rather
+than borrowed). In exchange you get constant memory — and, for large documents,
+often *better* throughput, because the pipeline overlaps decompression with
+parsing and keeps each batch cache-resident instead of materializing the whole
+document. On a 2M-record / 184 MiB-decompressed file the streaming path measured
+~2.2× faster than `from_path`; see [`DECISIONS.md`](DECISIONS.md) §15.
 
 ## API at a glance
 

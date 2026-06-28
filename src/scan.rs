@@ -869,9 +869,15 @@ impl StreamFramer {
         }
     }
 
-    /// Advance the framer over the buffered bytes. Returns the next complete
-    /// record as owned bytes, or `Ok(None)` when more input is needed.
-    pub(crate) fn next_record(&mut self) -> Result<Option<(usize, Box<[u8]>)>, XmlError> {
+    /// Advance the framer over the buffered bytes. On a complete record, its
+    /// bytes are appended to `arena` and `(index, span)` is returned (the span
+    /// indexes into `arena`); `Ok(None)` means more input is needed. Appending
+    /// into a caller-owned arena lets the producer pack many records into one
+    /// allocation (see the streaming batcher).
+    pub(crate) fn next_record_into(
+        &mut self,
+        arena: &mut Vec<u8>,
+    ) -> Result<Option<(usize, Range<usize>)>, XmlError> {
         let mut i = self.cursor - self.base;
         let n = self.carry.len();
         while i < n && !self.finished {
@@ -1005,12 +1011,12 @@ impl StreamFramer {
                                 let start =
                                     self.record_start.take().ok_or(XmlError::Malformed(end))?;
                                 self.cursor = end;
-                                return Ok(Some(self.emit(start, end)));
+                                return Ok(Some(self.emit(arena, start, end)));
                             }
                         } else if prev_slash {
                             if self.depth == 1 {
                                 self.cursor = end;
-                                return Ok(Some(self.emit(self.tag_start, end)));
+                                return Ok(Some(self.emit(arena, self.tag_start, end)));
                             }
                         } else if self.depth == 1 {
                             self.record_start = Some(self.tag_start);
@@ -1032,13 +1038,12 @@ impl StreamFramer {
         Ok(None)
     }
 
-    fn emit(&mut self, start: usize, end: usize) -> (usize, Box<[u8]>) {
-        let bytes = self.carry[start - self.base..end - self.base]
-            .to_vec()
-            .into_boxed_slice();
+    fn emit(&mut self, arena: &mut Vec<u8>, start: usize, end: usize) -> (usize, Range<usize>) {
+        let from = arena.len();
+        arena.extend_from_slice(&self.carry[start - self.base..end - self.base]);
         let index = self.next_index;
         self.next_index += 1;
-        (index, bytes)
+        (index, from..arena.len())
     }
 }
 
@@ -1214,8 +1219,9 @@ mod tests {
         }
         let mut out = Vec::new();
         loop {
-            while let Some((_index, bytes)) = framer.next_record().unwrap() {
-                out.push(String::from_utf8(bytes.to_vec()).unwrap());
+            let mut arena = Vec::new();
+            while let Some((_index, span)) = framer.next_record_into(&mut arena).unwrap() {
+                out.push(String::from_utf8(arena[span].to_vec()).unwrap());
             }
             framer.compact();
             if fed >= input.len() {
@@ -1261,8 +1267,9 @@ mod tests {
         let mut framer = StreamFramer::new();
         framer.push(b"<r><a/><b/><c/></r>");
         assert!(framer.try_prelude().unwrap().is_some());
+        let mut arena = Vec::new();
         let mut indices = Vec::new();
-        while let Some((index, _)) = framer.next_record().unwrap() {
+        while let Some((index, _span)) = framer.next_record_into(&mut arena).unwrap() {
             indices.push(index);
         }
         assert_eq!(indices, vec![0, 1, 2]);

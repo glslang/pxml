@@ -258,14 +258,20 @@ knowing where the object boundaries are, to feed `rayon`.
 
 **Decision.** A new `StreamReader` type (kept distinct from `ParallelXml`, since
 one borrows slices and the other owns them). A single **producer thread**
-decompresses and frames records and sends each as **owned bytes** into a
-**bounded channel**; the workers drain it via `rayon`'s `par_bridge` under
-`thread::scope`. Output is **unordered**.
+decompresses and frames records, packs them into **batches** (each backed by one
+**arena** allocation), and sends batches into a **bounded channel**; the workers
+drain it via `rayon`'s `par_bridge` under `thread::scope`, parsing a whole batch
+each. Output is **unordered**.
 
 **Why these specifics.**
-- *Owned records (`Box<[u8]>`)*: a worker may outlive the producer's view of those
-  bytes and the producer compacts its buffer, so each record is copied out. The
-  copy is tiny next to decompress + parse.
+- *Batches + arena (`B = 256` records)*: this is the throughput lever (see 15).
+  Sending one batch instead of `B` records amortizes the channel send and the
+  `par_bridge` receiver mutex over `B` records, and the framer appends each
+  record's bytes into a single per-batch `Vec<u8>` (one allocation per batch, not
+  per record). Records are *owned* because a worker may outlive the producer's
+  view of those bytes (the producer compacts its buffer), and the copy is tiny
+  next to decompress + parse — and it makes each batch arena cache-resident during
+  parsing.
 - *Bounded channel = backpressure*: the producer blocks when the queue is full, so
   it only runs ahead `≈ 2 × threads` records. This is the knob that bounds memory.
   Unbounded, the producer would race ahead and re-materialize the whole file.
@@ -286,18 +292,23 @@ parity with the materialized scanner across chunk sizes 1…1000.
 **Memory bound.**
 ```
 prelude (shared, small)
-+ producer carry buffer    (one in-progress record + one decompress chunk)
-+ queue_depth × record     (framed but not yet parsed; queue_depth ≈ 2×threads)
-+ results retained         (none for par_for_each)
++ producer carry buffer        (one in-progress record + one decompress chunk)
++ batch being built            (≤ B records)
++ queue_depth batches in flight (capacity × B records; capacity ≈ 2×threads)
++ results retained             (none for par_for_each)
 ```
-The bound is **O(threads × max_record_size)**, *not* O(threads × average): a
-record can't be split across workers, so the producer must buffer a whole record
-before emitting it. Fine for many small uniform records; pathological for a single
-multi-GB element.
+≈ **O(threads × B × record_size)**, still independent of document size (`B`
+trades a little memory + first-batch latency for throughput). The per-record floor
+is **O(max_record_size)**: a record can't be split across workers, so the producer
+must buffer a whole record before emitting it. Fine for many small uniform
+records; pathological for a single multi-GB element.
 
-**Consequences.** Constant memory regardless of document size — the point of the
-feature — at a throughput cost (15). Decompression + framing remain sequential (a
-single producer), so they bound the achievable speedup (Amdahl).
+**Consequences.** Constant memory regardless of document size. With batching this
+is *not* at a throughput cost — for large documents the streaming path is actually
+**faster** than resident (15), because it pipelines decompression with parsing,
+keeps each batch arena cache-resident, and never materializes the whole document.
+Decompression + framing are still sequential (a single producer), which is the
+remaining serial-fraction ceiling.
 
 ---
 
@@ -321,27 +332,43 @@ as `DESIGN.md` predicts.
 | Path | Wall time | Throughput |
 |---|---|---|
 | resident (`from_path`) | ~840 ms | ~2.4 M rec/s, ~219 MiB/s |
-| streaming (`from_zstd_reader`) | ~2120 ms | ~0.94 M rec/s, ~87 MiB/s |
+| streaming, per-record handoff (initial) | ~2120 ms | ~0.94 M rec/s, ~87 MiB/s |
+| **streaming, batched + arena** | **~380 ms** | **~5.3 M rec/s, ~490 MiB/s** |
 
-**Finding.** Streaming is **~2.5× slower** here. The single producer
-(decompress + byte-by-byte framing + a `Box` allocation per record + channel send,
-drained by `par_bridge`'s mutex-synchronized pull) is the bottleneck for millions
-of tiny records, and the workers starve. **Streaming buys bounded memory, not
-speed** — the resident path holds ~184 MiB; streaming holds a near-constant
-working set. For the target scenario (several multi-GB files at once) that memory
-bound is the whole point; for a single file that fits in RAM, the resident path is
-both simpler and faster.
+**Initial finding.** With a per-record handoff, streaming was **~2.5× slower**: the
+single producer (decompress + byte-by-byte framing + a `Box` per record + channel
+send, drained by `par_bridge`'s mutex-synchronized pull) was the bottleneck for
+millions of tiny records, and the workers starved.
+
+**After batching + arena (13/14).** Packing `B = 256` records per channel message
+and per arena allocation cut streaming to **~380 ms — a 5.5× speedup, and ~2.2×
+*faster* than resident.** The gap didn't just close, it inverted. Three effects
+compound:
+
+1. **Amortized handoff** — one `send` / `par_bridge` pull per 256 records collapses
+   the channel + mutex traffic that dominated before.
+2. **One allocation per batch**, not per record.
+3. **Pipelining + cache locality** — the producer's decompression overlaps the
+   parallel parse, and each ~25 KiB batch arena stays cache-resident while a worker
+   parses it. The resident path instead makes several passes over a 184 MiB buffer
+   that doesn't fit in cache, and pays to materialize all 184 MiB up front.
+
+**Takeaway.** For large documents the streaming pipeline is both bounded-memory
+*and* faster — it can be the preferred path, not just a memory fallback. The
+caveats: this is a uniform-small-record, highly-compressible, machine-specific
+benchmark; for inputs that fit in cache or heavier per-record parse work the
+advantage shrinks, and the single sequential producer remains the ceiling.
 
 ---
 
 ## Future work
 
-- **Reduce streaming overhead.** Batch multiple records per channel message
-  (amortize the channel + `par_bridge` mutex), reuse/arena-allocate record buffers
-  instead of one `Box` each, and consider a `memchr`-driven framer fast path. The
-  producer is the bottleneck, so this is where throughput is.
-- **Parallel decompression / parallel Phase A.** zstd multi-frame or a speculative
-  chunk-and-verify scan would attack the remaining serial fraction.
+- **Reduce streaming overhead further.** Batching + arena are done (15). A
+  `memchr`-driven streaming framer (the content scan is still byte-by-byte) and a
+  tunable `B` would chip at the remaining producer cost.
+- **Parallel decompression / parallel Phase A.** The single sequential producer is
+  now the ceiling. zstd multi-frame decode or a speculative chunk-and-verify scan
+  would attack the remaining serial fraction.
 - **Namespace resolution.** Optionally resolve prefixes per event using
   `Prelude::namespaces` plus record-local declarations.
 - **Ordered streaming.** A bounded reorder buffer for `map_collect`-style streaming
