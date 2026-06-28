@@ -768,7 +768,8 @@ fn make_prelude(
     }
 }
 
-/// Lexical state of the resumable content framer.
+/// Lexical state of the resumable content framer (default byte-by-byte variant).
+#[cfg(not(feature = "memchr-framer"))]
 #[derive(Clone, Copy)]
 enum Cs {
     Text,
@@ -787,6 +788,27 @@ enum Cs {
     /// Inside a start/end tag. `quote` is the open quote byte (0 = none);
     /// `prev_slash` tracks a `/` immediately before a possible `>`.
     Tag { is_end: bool, quote: u8, prev_slash: bool },
+}
+
+/// Lexical state of the resumable content framer (`memchr-framer` variant).
+/// Multi-byte spans (comment, CDATA, PI bodies and tag interiors) are skipped
+/// with `memchr`/`memmem`; terminators that straddle a chunk boundary are
+/// handled by retaining the last `needle.len() - 1` bytes (see
+/// [`StreamFramer::skip_to`]).
+#[cfg(feature = "memchr-framer")]
+#[derive(Clone, Copy)]
+enum Cs {
+    Text,
+    Lt,
+    Bang,
+    BangDash,
+    Comment,
+    CdataMatch(u8),
+    Cdata,
+    Pi,
+    /// Inside a start/end tag. `quote` is the open quote byte (0 = none); a `>`
+    /// outside quotes ends the tag.
+    Tag { is_end: bool, quote: u8 },
 }
 
 /// Resumable depth-1 record framer. Feed bytes with [`StreamFramer::push`],
@@ -874,6 +896,7 @@ impl StreamFramer {
     /// indexes into `arena`); `Ok(None)` means more input is needed. Appending
     /// into a caller-owned arena lets the producer pack many records into one
     /// allocation (see the streaming batcher).
+    #[cfg(not(feature = "memchr-framer"))]
     pub(crate) fn next_record_into(
         &mut self,
         arena: &mut Vec<u8>,
@@ -1038,12 +1061,171 @@ impl StreamFramer {
         Ok(None)
     }
 
+    /// Advance the framer over the buffered bytes. On a complete record, its
+    /// bytes are appended to `arena` and `(index, span)` is returned (the span
+    /// indexes into `arena`); `Ok(None)` means more input is needed. Appending
+    /// into a caller-owned arena lets the producer pack many records into one
+    /// allocation (see the streaming batcher).
+    #[cfg(feature = "memchr-framer")]
+    pub(crate) fn next_record_into(
+        &mut self,
+        arena: &mut Vec<u8>,
+    ) -> Result<Option<(usize, Range<usize>)>, XmlError> {
+        let mut i = self.cursor - self.base;
+        let n = self.carry.len();
+        while i < n && !self.finished {
+            match self.state {
+                Cs::Text => match memchr(b'<', &self.carry[i..]) {
+                    Some(off) => {
+                        self.tag_start = self.base + i + off;
+                        i += off + 1;
+                        self.state = Cs::Lt;
+                    }
+                    None => i = n,
+                },
+                Cs::Lt => {
+                    match self.carry[i] {
+                        b'?' => self.state = Cs::Pi,
+                        b'!' => self.state = Cs::Bang,
+                        b'/' => self.state = Cs::Tag { is_end: true, quote: 0 },
+                        c if is_name_start(c) => {
+                            self.state = Cs::Tag { is_end: false, quote: 0 }
+                        }
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::Bang => {
+                    match self.carry[i] {
+                        b'-' => self.state = Cs::BangDash,
+                        b'[' => self.state = Cs::CdataMatch(0),
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::BangDash => {
+                    match self.carry[i] {
+                        b'-' => self.state = Cs::Comment,
+                        _ => return Err(XmlError::Malformed(self.base + i)),
+                    }
+                    i += 1;
+                }
+                Cs::Comment => match self.skip_to(i, b"-->") {
+                    Some(next) => {
+                        i = next;
+                        self.state = Cs::Text;
+                    }
+                    None => return Ok(None),
+                },
+                Cs::CdataMatch(k) => {
+                    const LIT: &[u8] = b"CDATA[";
+                    if self.carry[i] == LIT[k as usize] {
+                        self.state = if k as usize + 1 == LIT.len() {
+                            Cs::Cdata
+                        } else {
+                            Cs::CdataMatch(k + 1)
+                        };
+                        i += 1;
+                    } else {
+                        return Err(XmlError::Malformed(self.base + i));
+                    }
+                }
+                Cs::Cdata => match self.skip_to(i, b"]]>") {
+                    Some(next) => {
+                        i = next;
+                        self.state = Cs::Text;
+                    }
+                    None => return Ok(None),
+                },
+                Cs::Pi => match self.skip_to(i, b"?>") {
+                    Some(next) => {
+                        i = next;
+                        self.state = Cs::Text;
+                    }
+                    None => return Ok(None),
+                },
+                Cs::Tag { is_end, quote } if quote != 0 => {
+                    // Skip a quoted attribute value to its closing quote.
+                    match memchr(quote, &self.carry[i..]) {
+                        Some(off) => {
+                            i += off + 1;
+                            self.state = Cs::Tag { is_end, quote: 0 };
+                        }
+                        None => {
+                            self.cursor = self.base + n;
+                            return Ok(None);
+                        }
+                    }
+                }
+                Cs::Tag { is_end, quote: _ } => {
+                    // Jump to the next `>` or opening quote.
+                    let off = match memchr3(b'>', b'"', b'\'', &self.carry[i..]) {
+                        Some(off) => off,
+                        None => {
+                            self.cursor = self.base + n;
+                            return Ok(None);
+                        }
+                    };
+                    let pos = i + off;
+                    if self.carry[pos] != b'>' {
+                        i = pos + 1;
+                        self.state = Cs::Tag { is_end, quote: self.carry[pos] };
+                        continue;
+                    }
+                    // Tag end. A self-closing start tag has `/` just before `>`.
+                    let end = self.base + pos + 1;
+                    let self_closing = !is_end && pos > 0 && self.carry[pos - 1] == b'/';
+                    i = pos + 1;
+                    self.state = Cs::Text;
+                    if is_end {
+                        self.depth = self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
+                        if self.depth == 0 {
+                            self.finished = true;
+                        } else if self.depth == 1 {
+                            let start = self.record_start.take().ok_or(XmlError::Malformed(end))?;
+                            self.cursor = end;
+                            return Ok(Some(self.emit(arena, start, end)));
+                        }
+                    } else if self_closing {
+                        if self.depth == 1 {
+                            self.cursor = end;
+                            return Ok(Some(self.emit(arena, self.tag_start, end)));
+                        }
+                    } else if self.depth == 1 {
+                        self.record_start = Some(self.tag_start);
+                        self.depth = 2;
+                    } else {
+                        self.depth += 1;
+                    }
+                }
+            }
+        }
+        self.cursor = self.base + i;
+        Ok(None)
+    }
+
     fn emit(&mut self, arena: &mut Vec<u8>, start: usize, end: usize) -> (usize, Range<usize>) {
         let from = arena.len();
         arena.extend_from_slice(&self.carry[start - self.base..end - self.base]);
         let index = self.next_index;
         self.next_index += 1;
         (index, from..arena.len())
+    }
+
+    /// Find `needle` in `carry[i..]`. On success returns the index just past it.
+    /// On failure (need more input), retains the last `needle.len() - 1` bytes —
+    /// the terminator may straddle the next chunk — and records the resume
+    /// cursor, then returns `None`.
+    #[cfg(feature = "memchr-framer")]
+    fn skip_to(&mut self, i: usize, needle: &[u8]) -> Option<usize> {
+        match memmem::find(&self.carry[i..], needle) {
+            Some(off) => Some(i + off + needle.len()),
+            None => {
+                let keep = needle.len() - 1;
+                self.cursor = self.base + self.carry.len().saturating_sub(keep).max(i);
+                None
+            }
+        }
     }
 }
 

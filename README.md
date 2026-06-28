@@ -213,8 +213,8 @@ The in-memory mode prints a sequential baseline and `par_for_each` across thread
 counts (throughput + speedup) plus a small-input fallback demonstration. The
 `file` mode compares the resident `from_path` path against the streaming
 `from_zstd_reader` path on a real file. See [`DECISIONS.md`](DECISIONS.md) §15 for
-measured numbers and analysis (notably: streaming trades throughput for bounded
-memory).
+measured numbers and analysis (notably: with batching, streaming is both
+bounded-memory *and* ~2.2× faster than resident on a large file).
 
 ## What's handled
 
@@ -264,6 +264,7 @@ Built on [`quick-xml`] (Phase B parsing), [`rayon`] (work-stealing pool),
 
 ```sh
 cargo test --no-default-features   # build/test without the zstd C dependency
+cargo test --features memchr-framer # opt-in memchr/memmem streaming framer (see DECISIONS.md §16)
 ```
 
 ## License
