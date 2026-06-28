@@ -624,8 +624,11 @@ enum Construct {
 }
 
 /// Classify the markup at a prolog `<`. `Ok(None)` => need more bytes to decide.
+/// A non-`<` byte here is stray content before the root, i.e. malformed.
 fn classify_prolog(rest: &[u8]) -> Result<Option<Construct>, XmlError> {
-    debug_assert_eq!(rest[0], b'<');
+    if rest.first() != Some(&b'<') {
+        return Err(XmlError::Malformed(0));
+    }
     if rest.len() < 2 {
         return Ok(None);
     }
@@ -1646,4 +1649,82 @@ mod tests {
             "carry grew to {max_carry} bytes; the 100 KB comment was retained"
         );
     }
+
+    // --- Property tests ---------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// 0–2 `name="value"` attributes (no quotes/`<`/`&` in values).
+    fn arb_attrs() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            ("[a-z]{1,3}", "[a-z0-9 ]{0,4}").prop_map(|(k, v)| format!(" {k}=\"{v}\"")),
+            0..2,
+        )
+        .prop_map(|a| a.concat())
+    }
+
+    /// A well-formed element: self-closing / text / comment / CDATA leaves, or a
+    /// recursively-nested element. Names always match between open and close.
+    fn arb_element() -> impl Strategy<Value = String> {
+        let leaf = prop_oneof![
+            ("[a-z][a-z0-9]{0,3}", arb_attrs()).prop_map(|(n, a)| format!("<{n}{a}/>")),
+            ("[a-z][a-z0-9]{0,3}", arb_attrs(), "[a-z0-9 .]{0,8}")
+                .prop_map(|(n, a, t)| format!("<{n}{a}>{t}</{n}>")),
+            ("[a-z][a-z0-9]{0,3}", "[a-z0-9 ]{0,8}")
+                .prop_map(|(n, t)| format!("<{n}><!-- {t} --></{n}>")),
+            ("[a-z][a-z0-9]{0,3}", "[a-z0-9<> ]{0,8}")
+                .prop_map(|(n, t)| format!("<{n}><![CDATA[{t}]]></{n}>")),
+        ];
+        leaf.prop_recursive(3, 32, 3, |inner| {
+            ("[a-z][a-z0-9]{0,3}", arb_attrs(), prop::collection::vec(inner, 0..3))
+                .prop_map(|(n, a, kids)| format!("<{n}{a}>{}</{n}>", kids.concat()))
+        })
+    }
+
+    /// A document: a root containing whitespace-separated depth-1 records.
+    fn arb_doc() -> impl Strategy<Value = String> {
+        (
+            "[a-z][a-z0-9]{0,3}",
+            prop::collection::vec(("[ \n\t]{0,2}", arb_element()), 0..5),
+            "[ \n\t]{0,2}",
+        )
+            .prop_map(|(root, recs, trailing)| {
+                let body: String = recs.into_iter().map(|(ws, e)| format!("{ws}{e}")).collect();
+                format!("<{root}>{body}{trailing}</{root}>")
+            })
+    }
+
+    proptest! {
+        /// The streaming framer frames the same records as the materialized
+        /// scanner, for any chunk size — the chunked unit test's property,
+        /// generalized over generated documents.
+        #[test]
+        fn streaming_matches_materialized_prop(doc in arb_doc(), chunk in 1usize..40) {
+            let bytes = doc.as_bytes();
+            let Ok(idx) = scan(bytes) else { return Ok(()); };
+            let expected: Vec<String> = idx
+                .records()
+                .iter()
+                .map(|r| String::from_utf8(bytes[r.clone()].to_vec()).unwrap())
+                .collect();
+            prop_assert_eq!(stream_frame(bytes, chunk), expected);
+        }
+
+        /// Neither the materialized scanner nor the streaming framer panics on
+        /// arbitrary bytes — they may return `Err`, but never index out of
+        /// bounds or overflow.
+        #[test]
+        fn never_panics_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
+            let _ = scan(&bytes);
+
+            let mut framer = StreamFramer::new();
+            framer.push(&bytes);
+            if let Ok(Some(_)) = framer.try_prelude() {
+                let mut arena = Vec::new();
+                while let Ok(Some(_)) = framer.next_record_into(&mut arena) {}
+                let _ = framer.finish();
+            }
+        }
+    }
 }
+

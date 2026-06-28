@@ -11,9 +11,8 @@
 //!
 //! # Status
 //!
-//! Scaffold: the type definitions and public API surface are in place; the
-//! phase bodies are `todo!()`. Implement in the order `scan.rs` -> `parse.rs`
-//! -> `lib.rs`.
+//! v1 complete: two-phase scan-then-parse is implemented, tested, and benchmarked.
+//! See `README.md`, `DESIGN.md`, and `DECISIONS.md`.
 
 mod config;
 mod event;
@@ -245,8 +244,15 @@ impl ParallelXml {
     }
 
     /// Like [`map_collect`](Self::map_collect), but the closure returns a
-    /// `Result`. On success the output is in document order; on failure the call
-    /// short-circuits, returning the first [`XmlError::RecordError`].
+    /// `Result`. On success the output is in document order; a record failure is
+    /// wrapped as [`XmlError::RecordError`]`{ index, source }`.
+    ///
+    /// Short-circuiting differs by path: the **sequential fallback** stops at the
+    /// first error, but the **parallel path does not** — because building an
+    /// ordered `Vec<T>` means processing every record, rayon runs the closure for
+    /// all records and then returns one of the resulting errors. Use
+    /// [`try_par_for_each`](Self::try_par_for_each) when you need early
+    /// termination rather than a collected result.
     pub fn try_map_collect<T, F, E>(&self, f: F) -> Result<Vec<T>, XmlError>
     where
         T: Send,
