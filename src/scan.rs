@@ -866,20 +866,47 @@ impl StreamFramer {
     /// Drop already-consumed bytes so resident memory stays bounded.
     pub(crate) fn compact(&mut self) {
         let keep_from = match self.record_start {
+            // Inside an open record: keep from its start; we will emit those bytes.
             Some(rs) => rs,
-            None => {
-                if matches!(self.state, Cs::Text) {
-                    self.cursor
-                } else {
-                    self.tag_start
-                }
-            }
+            // Between records, in plain text or while skipping an ignored span
+            // (comment/CDATA/PI), nothing before `cursor` is needed — for an
+            // ignored span that is just the terminator overlap `skip_to`/the
+            // state machine left ahead of `cursor`. This keeps a huge root-level
+            // comment/CDATA/PI from growing the buffer to its full length.
+            None if matches!(self.state, Cs::Text) || self.in_skip_span() => self.cursor,
+            // Mid-classification of `<…` (it may still open a record): keep the
+            // `<` so the record's bytes survive.
+            None => self.tag_start,
         };
         let drop = keep_from - self.base;
         if drop > 0 {
             self.carry.drain(0..drop);
             self.base = keep_from;
         }
+    }
+
+    /// Whether the framer is inside a *confirmed* ignored span (comment / CDATA /
+    /// PI), whose already-scanned bytes can be dropped on compaction (the
+    /// terminator is found via retained overlap or via the state machine, not by
+    /// re-reading the whole span).
+    #[cfg(not(feature = "memchr-framer"))]
+    fn in_skip_span(&self) -> bool {
+        matches!(
+            self.state,
+            Cs::Comment
+                | Cs::CommentDash
+                | Cs::CommentDashDash
+                | Cs::Cdata
+                | Cs::CdataBracket
+                | Cs::CdataBracket2
+                | Cs::Pi
+                | Cs::PiQ
+        )
+    }
+
+    #[cfg(feature = "memchr-framer")]
+    fn in_skip_span(&self) -> bool {
+        matches!(self.state, Cs::Comment | Cs::Cdata | Cs::Pi)
     }
 
     /// Validate end-of-stream: the root must have closed.
@@ -1455,5 +1482,48 @@ mod tests {
             indices.push(index);
         }
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn large_ignored_comment_keeps_carry_bounded() {
+        // A big depth-1 comment between the root open and a record. Its bytes are
+        // ignored, so the framer must not retain the whole span (see compaction).
+        let mut input = String::from("<r><!--");
+        input.push_str(&"x".repeat(100_000));
+        input.push_str("--><a/></r>");
+        let bytes = input.as_bytes();
+
+        let mut framer = StreamFramer::new();
+        let mut fed = 0;
+        let feed = |framer: &mut StreamFramer, fed: &mut usize| {
+            let end = (*fed + 64).min(bytes.len());
+            framer.push(&bytes[*fed..end]);
+            *fed = end;
+        };
+        while framer.try_prelude().unwrap().is_none() {
+            feed(&mut framer, &mut fed);
+        }
+
+        let mut arena = Vec::new();
+        let mut max_carry = 0;
+        let mut records = 0;
+        loop {
+            while framer.next_record_into(&mut arena).unwrap().is_some() {
+                records += 1;
+            }
+            framer.compact();
+            max_carry = max_carry.max(framer.carry.len());
+            if fed >= bytes.len() {
+                framer.finish().unwrap();
+                break;
+            }
+            feed(&mut framer, &mut fed);
+        }
+
+        assert_eq!(records, 1, "the single <a/> record");
+        assert!(
+            max_carry < 1024,
+            "carry grew to {max_carry} bytes; the 100 KB comment was retained"
+        );
     }
 }
