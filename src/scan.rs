@@ -594,7 +594,7 @@ pub(crate) fn try_parse_prelude(buf: &[u8]) -> Result<Option<PreludeParse>, XmlE
         if i >= buf.len() {
             return Ok(None);
         }
-        match classify_prolog(&buf[i..])? {
+        match classify_prolog(&buf[i..], i)? {
             None => return Ok(None),
             Some(Construct::Comment) => match memmem::find(&buf[i + 4..], b"-->") {
                 Some(off) => i += 4 + off + 3,
@@ -623,11 +623,12 @@ enum Construct {
     Root,
 }
 
-/// Classify the markup at a prolog `<`. `Ok(None)` => need more bytes to decide.
-/// A non-`<` byte here is stray content before the root, i.e. malformed.
-fn classify_prolog(rest: &[u8]) -> Result<Option<Construct>, XmlError> {
+/// Classify the markup at a prolog `<` (`offset` is its absolute position in the
+/// buffer). `Ok(None)` => need more bytes to decide. A non-`<` byte here is stray
+/// content before the root, i.e. malformed.
+fn classify_prolog(rest: &[u8], offset: usize) -> Result<Option<Construct>, XmlError> {
     if rest.first() != Some(&b'<') {
-        return Err(XmlError::Malformed(0));
+        return Err(XmlError::Malformed(offset));
     }
     if rest.len() < 2 {
         return Ok(None);
@@ -1701,7 +1702,7 @@ mod tests {
         #[test]
         fn streaming_matches_materialized_prop(doc in arb_doc(), chunk in 1usize..40) {
             let bytes = doc.as_bytes();
-            let Ok(idx) = scan(bytes) else { return Ok(()); };
+            let idx = scan(bytes).expect("arb_doc should generate scannable documents");
             let expected: Vec<String> = idx
                 .records()
                 .iter()
@@ -1722,8 +1723,10 @@ mod tests {
             if let Ok(Some(_)) = framer.try_prelude() {
                 let mut arena = Vec::new();
                 while let Ok(Some(_)) = framer.next_record_into(&mut arena) {}
-                let _ = framer.finish();
             }
+            // Always exercise the end-of-stream path, even for truncated inputs
+            // whose prelude never completed.
+            let _ = framer.finish();
         }
     }
 }
