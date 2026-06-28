@@ -22,5 +22,8 @@ memmap2   = "0.9"
 memchr    = "2"
 zstd      = { version = "0.13", optional = true }
 
+[dev-dependencies]
+proptest = "1"
+
 [[example]]
 name = "bench"

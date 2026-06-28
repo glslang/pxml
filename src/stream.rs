@@ -70,6 +70,9 @@ impl<'a> StreamReader<'a> {
     /// Returns `Err` if framing or I/O fails; records already dispatched are
     /// still processed (siblings are not aborted). Per-record parse errors are
     /// the closure's concern (it drives `record.events()`).
+    ///
+    /// The workers run on rayon's current pool. To use a specific pool, wrap the
+    /// call: `pool.install(|| reader.par_for_each(f))`.
     pub fn par_for_each<F>(self, f: F) -> Result<(), XmlError>
     where
         F: Fn(&Record) + Sync,
