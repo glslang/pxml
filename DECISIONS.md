@@ -424,11 +424,18 @@ crate sells. Coalescing keeps that contract.
 the common case**: a lone literal text node still decodes borrowed straight from
 the document buffer, so no allocation. Only entity-bearing or multi-segment text
 allocates an owned `String` — which the old `unescape_with` path did anyway as
-soon as it saw an entity. CDATA still breaks a text run (it stays its own raw
-`Cdata` event). Covered by unit tests for char refs, adjacent/boundary entities,
-empty expansion, CDATA/element run terminators, and unknown-entity errors, plus a
-`coalesced_text_roundtrips` property test over random literal/entity/char-ref
-interleavings.
+soon as it saw an entity.
+
+**Text-node boundaries are preserved.** Coalescing only joins *immediately*
+adjacent `Text`/`GeneralRef` events: the run lookahead reads the next event raw
+(`read_raw`), so a CDATA, child element, comment, or PI between two text nodes
+ends the run. Comments/PIs are still not surfaced — the terminator is buffered
+and the next call's skip loop (`next_surfaced`) drops it if ignorable — but
+`<t>a<!--c-->&amp;</t>` stays `Text("a")`, `Text("&")` rather than collapsing to
+one event. Covered by unit tests for char refs, adjacent/boundary entities, empty
+expansion, CDATA/comment/PI/element run terminators, and unknown-entity errors,
+plus a `coalesced_text_roundtrips` property test over random literal/entity/
+char-ref interleavings.
 
 ---
 

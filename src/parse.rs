@@ -63,12 +63,16 @@ impl<'doc> RecordReader<'doc> {
     /// `GeneralRef` events, so a maximal run of `Text`/`GeneralRef` events is
     /// merged back into one resolved [`Event::Text`].
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>, XmlError> {
-        let Some(ev) = self.take_kept()? else {
+        let Some(ev) = self.next_surfaced()? else {
             return Ok(None);
         };
 
         if is_text_run(&ev) {
-            let next = self.take_kept()?;
+            // Peek the *immediately* following event (raw, skipping nothing): a
+            // comment or PI between two text nodes is a boundary, so the run must
+            // not coalesce across it. The terminator is buffered in `pending`;
+            // the next call's skip loop drops it if it is ignorable markup.
+            let next = self.read_raw()?;
             // Fast path: a lone literal text node decodes straight from the
             // document buffer (zero-copy for UTF-8), no allocation.
             let lone_literal =
@@ -91,7 +95,7 @@ impl<'doc> RecordReader<'doc> {
                     break;
                 }
                 append_run_event(&mut out, &ev, self.prelude.as_ref(), self.index)?;
-                cur = self.take_kept()?;
+                cur = self.read_raw()?;
             }
             return Ok(Some(Event::Text(Cow::Owned(out))));
         }
@@ -105,25 +109,35 @@ impl<'doc> RecordReader<'doc> {
         Ok(Some(event))
     }
 
-    /// Fetch the next surfaced event — from the one-slot lookahead buffer if
-    /// present, otherwise from the reader, skipping comments, PIs, and the
-    /// XML/DOCTYPE declarations. `Ok(None)` at end of input.
-    fn take_kept(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+    /// Read the next *surfaced* event, draining the lookahead buffer first and
+    /// skipping comments, PIs, and the XML/DOCTYPE declarations. Used only to
+    /// start an event; the text-run lookahead uses [`read_raw`](Self::read_raw)
+    /// so skipped markup still bounds a text node. `Ok(None)` at end of input.
+    fn next_surfaced(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+        loop {
+            match self.read_raw()? {
+                None => return Ok(None),
+                Some(
+                    QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_) | QxEvent::DocType(_),
+                ) => continue,
+                Some(keep) => return Ok(Some(keep)),
+            }
+        }
+    }
+
+    /// Read one raw event — from the one-slot lookahead buffer if present,
+    /// otherwise straight from the reader, skipping nothing. `Ok(None)` at Eof.
+    fn read_raw(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
         if let Some(ev) = self.pending.take() {
             return Ok(Some(ev));
         }
-        loop {
-            let ev = self
-                .reader
-                .read_event()
-                .map_err(|e| record_error(self.index, e))?;
-            match ev {
-                QxEvent::Eof => return Ok(None),
-                QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_) | QxEvent::DocType(_) => {
-                    continue;
-                }
-                keep => return Ok(Some(keep)),
-            }
+        match self
+            .reader
+            .read_event()
+            .map_err(|e| record_error(self.index, e))?
+        {
+            QxEvent::Eof => Ok(None),
+            ev => Ok(Some(ev)),
         }
     }
 }
@@ -339,6 +353,24 @@ mod tests {
         assert_eq!(
             events(b"<t>a&amp;<![CDATA[b]]>c</t>", prelude(&[])),
             ["S:t", "T:a&", "C:b", "T:c", "E:t"]
+        );
+    }
+
+    #[test]
+    fn comment_breaks_a_text_run() {
+        // A comment between text nodes is a boundary: the run must not coalesce
+        // across it, even though the comment itself is skipped.
+        assert_eq!(
+            events(b"<t>a<!--c-->&amp;</t>", prelude(&[])),
+            ["S:t", "T:a", "T:&", "E:t"]
+        );
+    }
+
+    #[test]
+    fn pi_breaks_a_text_run() {
+        assert_eq!(
+            events(b"<t>&amp;<?pi?>b</t>", prelude(&[])),
+            ["S:t", "T:&", "T:b", "E:t"]
         );
     }
 

@@ -373,12 +373,16 @@ impl<'doc> SeqReader<'doc> {
     /// Comments, PIs, and the XML declaration are skipped; a DOCTYPE's internal
     /// `<!ENTITY>` definitions are captured for subsequent entity resolution.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>, XmlError> {
-        let Some(ev) = self.take_kept()? else {
+        let Some(ev) = self.next_surfaced()? else {
             return Ok(None);
         };
 
         if is_text_run(&ev) {
-            let next = self.take_kept()?;
+            // Peek the *immediately* following event (raw, skipping nothing): a
+            // comment or PI between two text nodes is a boundary, so the run must
+            // not coalesce across it. The terminator is buffered in `pending`;
+            // the next call's skip loop drops it if it is ignorable markup.
+            let next = self.read_raw()?;
             // Fast path: a lone literal text node, decoded straight from the
             // document buffer (zero-copy for UTF-8).
             let lone_literal =
@@ -401,7 +405,7 @@ impl<'doc> SeqReader<'doc> {
                     break;
                 }
                 append_run_event(&mut out, &ev, &self.prelude, 0)?;
-                cur = self.take_kept()?;
+                cur = self.read_raw()?;
             }
             return Ok(Some(Event::Text(Cow::Owned(out))));
         }
@@ -415,26 +419,34 @@ impl<'doc> SeqReader<'doc> {
         Ok(Some(event))
     }
 
-    /// Fetch the next surfaced event — from the one-slot lookahead buffer if
-    /// present, otherwise from the reader, skipping comments, PIs, and the XML
-    /// declaration and capturing a DOCTYPE's internal `<!ENTITY>` definitions.
-    fn take_kept(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+    /// Read the next *surfaced* event, draining the lookahead buffer first and
+    /// skipping comments, PIs, and the XML declaration, while capturing a
+    /// DOCTYPE's internal `<!ENTITY>` definitions. Used only to start an event;
+    /// the text-run lookahead uses [`read_raw`](Self::read_raw) so skipped markup
+    /// still bounds a text node. `Ok(None)` at end of input.
+    fn next_surfaced(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+        loop {
+            match self.read_raw()? {
+                None => return Ok(None),
+                Some(QxEvent::DocType(e)) => {
+                    parse_doctype_entities(&e, &mut self.prelude.entities);
+                }
+                Some(QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_)) => continue,
+                Some(keep) => return Ok(Some(keep)),
+            }
+        }
+    }
+
+    /// Read one raw event — from the one-slot lookahead buffer if present,
+    /// otherwise straight from the reader, skipping nothing. `Ok(None)` at Eof.
+    fn read_raw(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
         if let Some(ev) = self.pending.take() {
             return Ok(Some(ev));
         }
-        loop {
-            let ev = match self.reader.read_event() {
-                Ok(ev) => ev,
-                Err(_) => return Err(XmlError::Malformed(self.reader.buffer_position() as usize)),
-            };
-            match ev {
-                QxEvent::Eof => return Ok(None),
-                QxEvent::DocType(e) => {
-                    parse_doctype_entities(&e, &mut self.prelude.entities);
-                }
-                QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_) => {}
-                keep => return Ok(Some(keep)),
-            }
+        match self.reader.read_event() {
+            Ok(QxEvent::Eof) => Ok(None),
+            Ok(ev) => Ok(Some(ev)),
+            Err(_) => Err(XmlError::Malformed(self.reader.buffer_position() as usize)),
         }
     }
 }
