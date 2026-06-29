@@ -39,7 +39,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event as QxEvent;
 use rayon::prelude::*;
 
-use crate::parse::map_event;
+use crate::parse::{append_run_event, decode_text, is_text_run, map_event};
 use crate::scan::parse_doctype_entities;
 
 /// Owns the document buffer (heap `Vec` or `mmap`) plus a [`Config`], and is the
@@ -344,6 +344,9 @@ impl<'doc> Record<'doc> {
 pub struct SeqReader<'doc> {
     reader: Reader<&'doc [u8]>,
     current: Option<QxEvent<'doc>>,
+    /// One-slot lookahead: an event already read but not yet surfaced (the
+    /// structural event that terminated a coalesced text run).
+    pending: Option<QxEvent<'doc>>,
     /// Holds the lazily-captured entity map (and otherwise-empty context) used
     /// to resolve entity references via the shared event mapper.
     prelude: Prelude,
@@ -356,6 +359,7 @@ impl<'doc> SeqReader<'doc> {
         Self {
             reader,
             current: None,
+            pending: None,
             prelude: Prelude {
                 encoding: Encoding::Utf8,
                 root_name: Box::default(),
@@ -369,29 +373,81 @@ impl<'doc> SeqReader<'doc> {
     /// Comments, PIs, and the XML declaration are skipped; a DOCTYPE's internal
     /// `<!ENTITY>` definitions are captured for subsequent entity resolution.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>, XmlError> {
-        loop {
-            let ev = match self.reader.read_event() {
-                Ok(ev) => ev,
-                Err(_) => return Err(XmlError::Malformed(self.reader.buffer_position() as usize)),
-            };
-            match ev {
-                QxEvent::Eof => return Ok(None),
-                QxEvent::DocType(e) => {
-                    parse_doctype_entities(&e, &mut self.prelude.entities);
-                }
-                QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_) => {}
-                keep => {
-                    self.current = Some(keep);
+        let Some(ev) = self.next_surfaced()? else {
+            return Ok(None);
+        };
+
+        if is_text_run(&ev) {
+            // Peek the *immediately* following event (raw, skipping nothing): a
+            // comment or PI between two text nodes is a boundary, so the run must
+            // not coalesce across it. The terminator is buffered in `pending`;
+            // the next call's skip loop drops it if it is ignorable markup.
+            let next = self.read_raw()?;
+            // Fast path: a lone literal text node, decoded straight from the
+            // document buffer (zero-copy for UTF-8).
+            let lone_literal =
+                matches!(ev, QxEvent::Text(_)) && !next.as_ref().is_some_and(is_text_run);
+            if lone_literal {
+                let QxEvent::Text(e) = &ev else {
+                    unreachable!("checked Text above")
+                };
+                let text = decode_text(e, 0)?;
+                self.pending = next;
+                return Ok(Some(Event::Text(text)));
+            }
+            // Otherwise coalesce the run into one owned, fully-resolved string.
+            let mut out = String::new();
+            append_run_event(&mut out, &ev, &self.prelude, 0)?;
+            let mut cur = next;
+            while let Some(ev) = cur {
+                if !is_text_run(&ev) {
+                    self.pending = Some(ev);
                     break;
                 }
+                append_run_event(&mut out, &ev, &self.prelude, 0)?;
+                cur = self.read_raw()?;
             }
+            return Ok(Some(Event::Text(Cow::Owned(out))));
         }
+
+        self.current = Some(ev);
         let event = map_event(
             self.current.as_ref().expect("event stored above"),
             &self.prelude,
             0,
         )?;
         Ok(Some(event))
+    }
+
+    /// Read the next *surfaced* event, draining the lookahead buffer first and
+    /// skipping comments, PIs, and the XML declaration, while capturing a
+    /// DOCTYPE's internal `<!ENTITY>` definitions. Used only to start an event;
+    /// the text-run lookahead uses [`read_raw`](Self::read_raw) so skipped markup
+    /// still bounds a text node. `Ok(None)` at end of input.
+    fn next_surfaced(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+        loop {
+            match self.read_raw()? {
+                None => return Ok(None),
+                Some(QxEvent::DocType(e)) => {
+                    parse_doctype_entities(&e, &mut self.prelude.entities);
+                }
+                Some(QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_)) => continue,
+                Some(keep) => return Ok(Some(keep)),
+            }
+        }
+    }
+
+    /// Read one raw event — from the one-slot lookahead buffer if present,
+    /// otherwise straight from the reader, skipping nothing. `Ok(None)` at Eof.
+    fn read_raw(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+        if let Some(ev) = self.pending.take() {
+            return Ok(Some(ev));
+        }
+        match self.reader.read_event() {
+            Ok(QxEvent::Eof) => Ok(None),
+            Ok(ev) => Ok(Some(ev)),
+            Err(_) => Err(XmlError::Malformed(self.reader.buffer_position() as usize)),
+        }
     }
 }
 
