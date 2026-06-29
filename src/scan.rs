@@ -107,8 +107,8 @@ impl<'a> Scanner<'a> {
             && after.is_some_and(|c| is_xml_ws(c) || c == b'?');
         if is_decl {
             let start = self.pos + 5;
-            let end_off = memmem::find(&self.buf[start..], b"?>")
-                .ok_or(XmlError::Malformed(self.pos))?;
+            let end_off =
+                memmem::find(&self.buf[start..], b"?>").ok_or(XmlError::Malformed(self.pos))?;
             let decl = &self.buf[start..start + end_off];
             if let Some(enc) = pseudo_attr(decl, b"encoding")
                 && !enc.eq_ignore_ascii_case(b"utf-8")
@@ -123,7 +123,10 @@ impl<'a> Scanner<'a> {
 
     /// Skip whitespace / comments / PIs and parse an optional DOCTYPE until the
     /// cursor reaches the root start tag.
-    fn skip_prolog_misc(&mut self, entities: &mut HashMap<Box<str>, Box<str>>) -> Result<(), XmlError> {
+    fn skip_prolog_misc(
+        &mut self,
+        entities: &mut HashMap<Box<str>, Box<str>>,
+    ) -> Result<(), XmlError> {
         loop {
             self.skip_ws();
             let rest = &self.buf[self.pos..];
@@ -148,7 +151,10 @@ impl<'a> Scanner<'a> {
     /// external DTD (`SYSTEM`/`PUBLIC`) is rejected with
     /// [`XmlError::UnsupportedDtd`] rather than silently skipped, since we can't
     /// resolve the global entities it may declare.
-    fn parse_doctype(&mut self, entities: &mut HashMap<Box<str>, Box<str>>) -> Result<(), XmlError> {
+    fn parse_doctype(
+        &mut self,
+        entities: &mut HashMap<Box<str>, Box<str>>,
+    ) -> Result<(), XmlError> {
         let n = self.buf.len();
         let mut i = self.pos + b"<!DOCTYPE".len();
         let mut in_subset = false;
@@ -817,7 +823,11 @@ enum Cs {
     PiQ,
     /// Inside a start/end tag. `quote` is the open quote byte (0 = none);
     /// `prev_slash` tracks a `/` immediately before a possible `>`.
-    Tag { is_end: bool, quote: u8, prev_slash: bool },
+    Tag {
+        is_end: bool,
+        quote: u8,
+        prev_slash: bool,
+    },
 }
 
 /// Lexical state of the resumable content framer (`memchr-framer` variant).
@@ -838,7 +848,10 @@ enum Cs {
     Pi,
     /// Inside a start/end tag. `quote` is the open quote byte (0 = none); a `>`
     /// outside quotes ends the tag.
-    Tag { is_end: bool, quote: u8 },
+    Tag {
+        is_end: bool,
+        quote: u8,
+    },
 }
 
 /// Resumable depth-1 record framer. Feed bytes with [`StreamFramer::push`],
@@ -972,8 +985,7 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
-                        if self.depth == 1
-                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        if self.depth == 1 && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
                         {
                             return Err(XmlError::Malformed(self.base + i));
                         }
@@ -992,9 +1004,19 @@ impl StreamFramer {
                     match self.carry[i] {
                         b'?' => self.state = Cs::Pi,
                         b'!' => self.state = Cs::Bang,
-                        b'/' => self.state = Cs::Tag { is_end: true, quote: 0, prev_slash: false },
+                        b'/' => {
+                            self.state = Cs::Tag {
+                                is_end: true,
+                                quote: 0,
+                                prev_slash: false,
+                            }
+                        }
                         c if is_name_start(c) => {
-                            self.state = Cs::Tag { is_end: false, quote: 0, prev_slash: false }
+                            self.state = Cs::Tag {
+                                is_end: false,
+                                quote: 0,
+                                prev_slash: false,
+                            }
                         }
                         _ => return Err(XmlError::Malformed(self.base + i)),
                     }
@@ -1086,15 +1108,27 @@ impl StreamFramer {
                     }
                     i += 1;
                 }
-                Cs::Tag { is_end, quote, prev_slash } => {
+                Cs::Tag {
+                    is_end,
+                    quote,
+                    prev_slash,
+                } => {
                     let b = self.carry[i];
                     if quote != 0 {
                         if b == quote {
-                            self.state = Cs::Tag { is_end, quote: 0, prev_slash };
+                            self.state = Cs::Tag {
+                                is_end,
+                                quote: 0,
+                                prev_slash,
+                            };
                         }
                         i += 1;
                     } else if b == b'"' || b == b'\'' {
-                        self.state = Cs::Tag { is_end, quote: b, prev_slash: false };
+                        self.state = Cs::Tag {
+                            is_end,
+                            quote: b,
+                            prev_slash: false,
+                        };
                         i += 1;
                     } else if b == b'>' {
                         let end = self.base + i + 1;
@@ -1126,10 +1160,18 @@ impl StreamFramer {
                             self.depth += 1;
                         }
                     } else if b == b'/' {
-                        self.state = Cs::Tag { is_end, quote: 0, prev_slash: true };
+                        self.state = Cs::Tag {
+                            is_end,
+                            quote: 0,
+                            prev_slash: true,
+                        };
                         i += 1;
                     } else {
-                        self.state = Cs::Tag { is_end, quote: 0, prev_slash: false };
+                        self.state = Cs::Tag {
+                            is_end,
+                            quote: 0,
+                            prev_slash: false,
+                        };
                         i += 1;
                     }
                 }
@@ -1155,8 +1197,7 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
-                        if self.depth == 1
-                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        if self.depth == 1 && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
                         {
                             return Err(XmlError::Malformed(self.base + i));
                         }
@@ -1175,9 +1216,17 @@ impl StreamFramer {
                     match self.carry[i] {
                         b'?' => self.state = Cs::Pi,
                         b'!' => self.state = Cs::Bang,
-                        b'/' => self.state = Cs::Tag { is_end: true, quote: 0 },
+                        b'/' => {
+                            self.state = Cs::Tag {
+                                is_end: true,
+                                quote: 0,
+                            }
+                        }
                         c if is_name_start(c) => {
-                            self.state = Cs::Tag { is_end: false, quote: 0 }
+                            self.state = Cs::Tag {
+                                is_end: false,
+                                quote: 0,
+                            }
                         }
                         _ => return Err(XmlError::Malformed(self.base + i)),
                     }
@@ -1257,7 +1306,10 @@ impl StreamFramer {
                     let pos = i + off;
                     if self.carry[pos] != b'>' {
                         i = pos + 1;
-                        self.state = Cs::Tag { is_end, quote: self.carry[pos] };
+                        self.state = Cs::Tag {
+                            is_end,
+                            quote: self.carry[pos],
+                        };
                         continue;
                     }
                     // Tag end. A self-closing start tag has `/` just before `>`.
@@ -1365,7 +1417,10 @@ mod tests {
 
     #[test]
     fn greater_than_inside_attribute_value() {
-        assert_eq!(frames(r#"<r><a x="1 > 0"/></r>"#), vec![r#"<a x="1 > 0"/>"#]);
+        assert_eq!(
+            frames(r#"<r><a x="1 > 0"/></r>"#),
+            vec![r#"<a x="1 > 0"/>"#]
+        );
     }
 
     #[test]
@@ -1480,7 +1535,10 @@ mod tests {
         assert!(scan(b"").is_err(), "empty");
         assert!(scan(b"   ").is_err(), "no root element");
         assert!(scan(b"<r><a>").is_err(), "unclosed record");
-        assert!(scan(b"<r><a></r>").is_err(), "mismatched / root consumed by child");
+        assert!(
+            scan(b"<r><a></r>").is_err(),
+            "mismatched / root consumed by child"
+        );
         assert!(scan(b"<r></r>trailing").is_err(), "junk after root");
         assert!(scan(b"<r/>x").is_err(), "junk after self-closing root");
     }
@@ -1497,10 +1555,19 @@ mod tests {
 
     #[test]
     fn non_whitespace_text_under_root_is_rejected() {
-        assert!(scan(b"<r>junk<a/></r>").is_err(), "text before first record");
-        assert!(scan(b"<r><a/>junk<b/></r>").is_err(), "text between records");
+        assert!(
+            scan(b"<r>junk<a/></r>").is_err(),
+            "text before first record"
+        );
+        assert!(
+            scan(b"<r><a/>junk<b/></r>").is_err(),
+            "text between records"
+        );
         assert!(scan(b"<r><a/>junk</r>").is_err(), "text after last record");
-        assert!(scan(b"<r> \n\t <a/> \r\n </r>").is_ok(), "whitespace is allowed");
+        assert!(
+            scan(b"<r> \n\t <a/> \r\n </r>").is_ok(),
+            "whitespace is allowed"
+        );
     }
 
     /// Record byte-ranges per the materialized scanner, as strings.
@@ -1602,10 +1669,22 @@ mod tests {
 
     #[test]
     fn streaming_framer_enforces_well_formedness() {
-        assert!(stream_result(b"<r><a/></x>").is_err(), "mismatched root close");
-        assert!(stream_result(b"<r>junk<a/></r>").is_err(), "text before record");
-        assert!(stream_result(b"<r><a/>junk</r>").is_err(), "text after record");
-        assert!(stream_result(b"<r> <a/> </r>").is_ok(), "whitespace is allowed");
+        assert!(
+            stream_result(b"<r><a/></x>").is_err(),
+            "mismatched root close"
+        );
+        assert!(
+            stream_result(b"<r>junk<a/></r>").is_err(),
+            "text before record"
+        );
+        assert!(
+            stream_result(b"<r><a/>junk</r>").is_err(),
+            "text after record"
+        );
+        assert!(
+            stream_result(b"<r> <a/> </r>").is_ok(),
+            "whitespace is allowed"
+        );
     }
 
     #[test]
@@ -1677,7 +1756,11 @@ mod tests {
                 .prop_map(|(n, t)| format!("<{n}><![CDATA[{t}]]></{n}>")),
         ];
         leaf.prop_recursive(3, 32, 3, |inner| {
-            ("[a-z][a-z0-9]{0,3}", arb_attrs(), prop::collection::vec(inner, 0..3))
+            (
+                "[a-z][a-z0-9]{0,3}",
+                arb_attrs(),
+                prop::collection::vec(inner, 0..3),
+            )
                 .prop_map(|(n, a, kids)| format!("<{n}{a}>{}</{n}>", kids.concat()))
         })
     }
@@ -1730,4 +1813,3 @@ mod tests {
         }
     }
 }
-

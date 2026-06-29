@@ -38,7 +38,11 @@ pub struct Attrs<'a> {
 
 impl<'a> Attrs<'a> {
     pub(crate) fn new(raw: &'a [u8], prelude: &'a Prelude, index: usize) -> Self {
-        Self { raw, prelude, index }
+        Self {
+            raw,
+            prelude,
+            index,
+        }
     }
 
     /// The raw, undecoded attribute span of the start tag (everything after the
@@ -141,7 +145,8 @@ impl<'a> Iterator for AttrIter<'a> {
             Err(_) => return Some(Err(XmlError::Encoding)),
         };
         let prelude = self.prelude;
-        let value = match quick_xml::escape::unescape_with(value_str, |e| prelude.resolve_entity(e)) {
+        let value = match quick_xml::escape::unescape_with(value_str, |e| prelude.resolve_entity(e))
+        {
             Ok(v) => v,
             Err(e) => {
                 return Some(Err(XmlError::RecordError {

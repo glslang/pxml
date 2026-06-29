@@ -65,10 +65,10 @@ fn generate(n: usize) -> Vec<u8> {
     let mut s = String::with_capacity(n * 96 + 32);
     s.push_str("<trades>\n");
     for i in 0..n {
-        let _ = write!(
+        let _ = writeln!(
             s,
             "<trade id=\"{i}\" sym=\"AAPL\">\
-             <px>{}.{:02}</px><qty>{}</qty><note>fill &amp; done</note></trade>\n",
+             <px>{}.{:02}</px><qty>{}</qty><note>fill &amp; done</note></trade>",
             100 + i % 900,
             i % 100,
             1 + i % 1000,
@@ -88,7 +88,10 @@ fn synthetic_mode(args: &[String]) {
     };
 
     let data = generate(n);
-    println!("document: {n} records, {:.1} MiB\n", data.len() as f64 / MIB);
+    println!(
+        "document: {n} records, {:.1} MiB\n",
+        data.len() as f64 / MIB
+    );
 
     black_box(drive(&build(&data, parallel_config())));
 
@@ -122,7 +125,6 @@ fn parallel_config() -> Config {
     Config {
         parallel_threshold: 0,
         min_records: 0,
-        ..Config::default()
     }
 }
 
@@ -130,7 +132,6 @@ fn sequential_config() -> Config {
     Config {
         parallel_threshold: usize::MAX,
         min_records: usize::MAX,
-        ..Config::default()
     }
 }
 
@@ -144,7 +145,13 @@ fn time<T>(f: impl FnOnce() -> T) -> Duration {
     start.elapsed()
 }
 
-fn report(label: &str, elapsed: Duration, records: usize, bytes: usize, baseline: Option<Duration>) {
+fn report(
+    label: &str,
+    elapsed: Duration,
+    records: usize,
+    bytes: usize,
+    baseline: Option<Duration>,
+) {
     let secs = elapsed.as_secs_f64();
     print!(
         "  {label:<28} {:>9.2} ms   {:>6.1} M rec/s   {:>7.0} MiB/s",
@@ -248,7 +255,12 @@ fn file_mode(args: &[String]) {
                 .expect("stream");
             black_box(acc.load(Ordering::Relaxed));
         });
-        report_file("streaming (from_zstd_reader)", streaming, records, decompressed_len);
+        report_file(
+            "streaming (from_zstd_reader)",
+            streaming,
+            records,
+            decompressed_len,
+        );
     }
 }
 

@@ -233,7 +233,11 @@ impl ParallelXml {
             })
         };
         if self.run_sequential(buf.len(), index.records.len()) {
-            index.records.iter().enumerate().try_for_each(|(i, r)| one(i, r))
+            index
+                .records
+                .iter()
+                .enumerate()
+                .try_for_each(|(i, r)| one(i, r))
         } else {
             index
                 .records
@@ -274,7 +278,12 @@ impl ParallelXml {
             })
         };
         if self.run_sequential(buf.len(), index.records.len()) {
-            index.records.iter().enumerate().map(|(i, r)| one(i, r)).collect()
+            index
+                .records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| one(i, r))
+                .collect()
         } else {
             index
                 .records
@@ -377,7 +386,11 @@ impl<'doc> SeqReader<'doc> {
                 }
             }
         }
-        let event = map_event(self.current.as_ref().expect("event stored above"), &self.prelude, 0)?;
+        let event = map_event(
+            self.current.as_ref().expect("event stored above"),
+            &self.prelude,
+            0,
+        )?;
         Ok(Some(event))
     }
 }
@@ -466,7 +479,6 @@ mod tests {
         Config {
             parallel_threshold: 0,
             min_records: 0,
-            ..Config::default()
         }
     }
 
@@ -474,7 +486,9 @@ mod tests {
     fn map_collect_preserves_document_order() {
         let n = 2000;
         let px = ParallelXml::from_bytes(build_doc(n).into_bytes()).with_config(force_parallel());
-        let got: Vec<usize> = px.map_collect(|rec| record_text(rec).parse().unwrap()).unwrap();
+        let got: Vec<usize> = px
+            .map_collect(|rec| record_text(rec).parse().unwrap())
+            .unwrap();
         assert_eq!(got, (0..n).collect::<Vec<_>>());
     }
 
@@ -565,10 +579,7 @@ mod tests {
                 Event::Cdata(c) => format!("C:{}", std::str::from_utf8(c).unwrap()),
             });
         }
-        assert_eq!(
-            tags,
-            ["S:r", "S:a", "T:x", "E:a", "S:b", "E:b", "E:r"]
-        );
+        assert_eq!(tags, ["S:r", "S:a", "T:x", "E:a", "S:b", "E:b", "E:r"]);
     }
 
     #[test]
@@ -607,10 +618,15 @@ mod tests {
         let n = 500;
         let xml = build_doc(n);
         let compressed = zstd::encode_all(xml.as_bytes(), 3).unwrap();
-        assert!(compressed.len() < xml.len(), "input should actually compress");
+        assert!(
+            compressed.len() < xml.len(),
+            "input should actually compress"
+        );
 
         let doc = ParallelXml::from_zstd_bytes(&compressed).unwrap();
-        let got: Vec<usize> = doc.map_collect(|r| record_text(r).parse().unwrap()).unwrap();
+        let got: Vec<usize> = doc
+            .map_collect(|r| record_text(r).parse().unwrap())
+            .unwrap();
         assert_eq!(got, (0..n).collect::<Vec<_>>());
     }
 
