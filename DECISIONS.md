@@ -128,7 +128,9 @@ reused (with a lazily-filled entity map) by the streaming and sequential readers
 ## 7. Entity resolution: predefined + internal subset only
 
 **Decision.** Resolve the five predefined XML entities plus internal-subset
-`<!ENTITY name "value">` definitions, via `quick-xml`'s `unescape_with`. The
+`<!ENTITY name "value">` definitions, against the shared `Prelude` (attribute
+values via `quick-xml`'s free `escape::unescape_with`; text via the coalescing
+cursor — see decision 17). The
 materialized `scan()` **rejects** parameter entities (`<!ENTITY % …>`), external
 entities (`SYSTEM`/`PUBLIC`), and external DTDs with `XmlError::UnsupportedDtd`
 rather than silently skipping them (issue #3) — silently skipping risks
@@ -390,6 +392,43 @@ differ under `cfg`, and both pass the same chunk-size parity tests (1…1000).
 needle and never matched — the comment/CDATA never terminated. Caught by the
 chunk-size parity test (chunk=2 on a comment+CDATA input), which is exactly why
 that test sweeps many chunk sizes.
+
+---
+
+## 17. Coalescing text + `GeneralRef` events (quick-xml 0.40)
+
+**Context.** quick-xml 0.40 changed its event model: a `Text` event no longer
+carries `&…;` references inline. Each character or general entity reference in
+element content is surfaced as a standalone `Event::GeneralRef(BytesRef)`, so
+`<t>a &lt; b</t>` reads back as `Text("a ")`, `GeneralRef("lt")`, `Text(" b")`.
+There is no reader config to opt out. The old code resolved text via the removed
+`BytesText::unescape_with`; both reader cursors (`RecordReader`, `SeqReader`) hit
+the `unreachable!` arm of `map_event` once a `GeneralRef` reached it.
+
+**Decision.** Keep pxml's public contract — one `Event::Text` per text node, with
+all entities resolved — by **coalescing** a maximal run of `Text`/`GeneralRef`
+events back into a single event inside each cursor's `next_event`. A one-slot
+`pending` lookahead holds the structural event that terminates the run. A `Text`
+event now needs only `decode()` (no unescaping — references are separate events);
+a `GeneralRef` resolves as a character reference (`BytesRef::resolve_char_ref`)
+or a named entity (`Prelude::resolve_entity`), and an unknown name is rejected
+with `RecordError` (never silently dropped). `map_event` is now structural-only
+(`Start`/`Empty`/`End`/`CData`); the shared leaves (`is_text_run`, `decode_text`,
+`append_run_event`) live in `parse.rs`.
+
+**Why.** Surfacing `GeneralRef` to consumers (the other option) would fragment
+text and push reassembly onto every caller, defeating the StAX-convenience the
+crate sells. Coalescing keeps that contract.
+
+**Consequences.** The **zero-copy lending invariant (decision 4) is preserved for
+the common case**: a lone literal text node still decodes borrowed straight from
+the document buffer, so no allocation. Only entity-bearing or multi-segment text
+allocates an owned `String` — which the old `unescape_with` path did anyway as
+soon as it saw an entity. CDATA still breaks a text run (it stays its own raw
+`Cdata` event). Covered by unit tests for char refs, adjacent/boundary entities,
+empty expansion, CDATA/element run terminators, and unknown-entity errors, plus a
+`coalesced_text_roundtrips` property test over random literal/entity/char-ref
+interleavings.
 
 ---
 

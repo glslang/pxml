@@ -39,7 +39,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event as QxEvent;
 use rayon::prelude::*;
 
-use crate::parse::map_event;
+use crate::parse::{append_run_event, decode_text, is_text_run, map_event};
 use crate::scan::parse_doctype_entities;
 
 /// Owns the document buffer (heap `Vec` or `mmap`) plus a [`Config`], and is the
@@ -344,6 +344,9 @@ impl<'doc> Record<'doc> {
 pub struct SeqReader<'doc> {
     reader: Reader<&'doc [u8]>,
     current: Option<QxEvent<'doc>>,
+    /// One-slot lookahead: an event already read but not yet surfaced (the
+    /// structural event that terminated a coalesced text run).
+    pending: Option<QxEvent<'doc>>,
     /// Holds the lazily-captured entity map (and otherwise-empty context) used
     /// to resolve entity references via the shared event mapper.
     prelude: Prelude,
@@ -356,6 +359,7 @@ impl<'doc> SeqReader<'doc> {
         Self {
             reader,
             current: None,
+            pending: None,
             prelude: Prelude {
                 encoding: Encoding::Utf8,
                 root_name: Box::default(),
@@ -369,6 +373,55 @@ impl<'doc> SeqReader<'doc> {
     /// Comments, PIs, and the XML declaration are skipped; a DOCTYPE's internal
     /// `<!ENTITY>` definitions are captured for subsequent entity resolution.
     pub fn next_event(&mut self) -> Result<Option<Event<'_>>, XmlError> {
+        let Some(ev) = self.take_kept()? else {
+            return Ok(None);
+        };
+
+        if is_text_run(&ev) {
+            let next = self.take_kept()?;
+            // Fast path: a lone literal text node, decoded straight from the
+            // document buffer (zero-copy for UTF-8).
+            let lone_literal =
+                matches!(ev, QxEvent::Text(_)) && !next.as_ref().is_some_and(is_text_run);
+            if lone_literal {
+                let QxEvent::Text(e) = &ev else {
+                    unreachable!("checked Text above")
+                };
+                let text = decode_text(e, 0)?;
+                self.pending = next;
+                return Ok(Some(Event::Text(text)));
+            }
+            // Otherwise coalesce the run into one owned, fully-resolved string.
+            let mut out = String::new();
+            append_run_event(&mut out, &ev, &self.prelude, 0)?;
+            let mut cur = next;
+            while let Some(ev) = cur {
+                if !is_text_run(&ev) {
+                    self.pending = Some(ev);
+                    break;
+                }
+                append_run_event(&mut out, &ev, &self.prelude, 0)?;
+                cur = self.take_kept()?;
+            }
+            return Ok(Some(Event::Text(Cow::Owned(out))));
+        }
+
+        self.current = Some(ev);
+        let event = map_event(
+            self.current.as_ref().expect("event stored above"),
+            &self.prelude,
+            0,
+        )?;
+        Ok(Some(event))
+    }
+
+    /// Fetch the next surfaced event — from the one-slot lookahead buffer if
+    /// present, otherwise from the reader, skipping comments, PIs, and the XML
+    /// declaration and capturing a DOCTYPE's internal `<!ENTITY>` definitions.
+    fn take_kept(&mut self) -> Result<Option<QxEvent<'doc>>, XmlError> {
+        if let Some(ev) = self.pending.take() {
+            return Ok(Some(ev));
+        }
         loop {
             let ev = match self.reader.read_event() {
                 Ok(ev) => ev,
@@ -380,18 +433,9 @@ impl<'doc> SeqReader<'doc> {
                     parse_doctype_entities(&e, &mut self.prelude.entities);
                 }
                 QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_) => {}
-                keep => {
-                    self.current = Some(keep);
-                    break;
-                }
+                keep => return Ok(Some(keep)),
             }
         }
-        let event = map_event(
-            self.current.as_ref().expect("event stored above"),
-            &self.prelude,
-            0,
-        )?;
-        Ok(Some(event))
     }
 }
 
