@@ -1,6 +1,7 @@
 # pxml
 
 [![CI](https://github.com/glslang/pxml/actions/workflows/ci.yml/badge.svg)](https://github.com/glslang/pxml/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/glslang/pxml/graph/badge.svg)](https://codecov.io/gh/glslang/pxml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![edition 2024](https://img.shields.io/badge/edition-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
