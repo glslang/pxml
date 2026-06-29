@@ -16,7 +16,7 @@ zstd = ["dep:zstd"]
 memchr-framer = []
 
 [dependencies]
-quick-xml = "0.37"
+quick-xml = "0.40"
 rayon     = "1"
 memmap2   = "0.9"
 memchr    = "2"
