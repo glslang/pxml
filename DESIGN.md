@@ -305,6 +305,9 @@ A failure in one record carries its `index` and does not abort siblings in
 - Parallelizing Phase A itself (future: speculative chunk + verify).
 - Parallelism below depth 1 (nested content is parsed sequentially within its record
   — fine for the uniform-records target).
+  > Superseded by `DECISIONS.md` §18: records may live under a configurable
+  > container (`record_path`), not only at depth 1. Parallelism is still at the
+  > record level; content nested *within* a record is parsed sequentially.
 
 ---
 

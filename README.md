@@ -108,6 +108,29 @@ let idx = doc.index()?; // Phase A only
 println!("{} records", idx.len());
 ```
 
+### Records under a nested container
+
+By default the records are the root's direct children. When they instead live
+inside a wrapper element — alongside siblings that should be ignored — name the
+container with `record_path`. `pxml` skips the non-matching siblings, descends
+into the container (accumulating any `xmlns` it declares), and frames its direct
+children:
+
+```rust
+// <root><manifest>…</manifest><objects><object/><object/>…</objects></root>
+let doc = ParallelXml::from_path(Path::new("assets.xml"))?
+    .record_path(["objects"]); // skip <manifest>, frame each <object>
+let count = doc.index()?.len();
+```
+
+The path may descend several levels (`.record_path(["body", "objects"])`), the
+children of *every* matching container are framed, and it works on the streaming
+path too (`StreamReader::from_reader(r).record_path(["objects"])`). An empty path
+(the default) means the root itself.
+
+The container's namespace declarations are merged into the one shared `Prelude`
+context (see [Limitations](#limitations) for the multi-container caveat).
+
 ### Compressed input
 
 With the default `zstd` feature, `from_path` transparently decompresses a
@@ -162,7 +185,7 @@ document. On a 2M-record / 184 MiB-decompressed file the streaming path measured
 | Type | Purpose |
 |------|---------|
 | `ParallelXml` | Owns the buffer (`Vec` or `mmap`) + `Config`; entry point. |
-| `Config` | Tuning: `parallel_threshold`, `min_records`. |
+| `Config` | Tuning: `parallel_threshold`, `min_records`, `record_path`. |
 | `ChunkIndex` | Phase A output: per-record byte ranges + shared `Prelude`. |
 | `Prelude` | Immutable shared context: encoding, root name, namespaces, entities. |
 | `StreamReader` | Bounded-memory streaming pipeline over a `Read` / zstd source. |
@@ -226,8 +249,9 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
 
 - **Encoding / BOM** — UTF-8 (with or without BOM) is asserted up front; a UTF-16
   BOM or a non-UTF-8 declared encoding is rejected as `XmlError::Encoding`.
-- **Namespaces** — `xmlns` / `xmlns:prefix` on the root are captured into the
-  shared `Prelude` (see Limitations for how they're surfaced).
+- **Namespaces** — `xmlns` / `xmlns:prefix` on the root (and on any container
+  descended into via `record_path`) are captured into the shared `Prelude` (see
+  Limitations for how they're surfaced).
 - **Entities** — internal-subset `<!ENTITY>` definitions are captured in Phase A
   and resolved (alongside the predefined XML entities) when decoding text and
   attribute values. External DTDs and parameter entities are **rejected** with
@@ -236,10 +260,11 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
   record-lookalike text inside them never mis-frames a record. CDATA is surfaced
   raw; comments and PIs are not surfaced as events.
 - **Well-formedness** — Phase A checks depth, that the root end tag's name
-  matches the root, and that only whitespace appears directly under the root
-  (non-whitespace text between records is rejected). Nested-element name matching
-  is delegated to the per-record `quick-xml` parse; per-record parse errors carry
-  the record's `index`.
+  matches the root, and that only whitespace appears between sibling records and
+  descent-level elements (non-whitespace text there is rejected; content inside a
+  skipped sibling is not inspected). Nested-element name matching is delegated to
+  the per-record `quick-xml` parse; per-record parse errors carry the record's
+  `index`.
 - **Fallible record work** — `try_par_for_each` / `try_map_collect` take closures
   returning `Result`, surfacing failures as `XmlError::RecordError { index, .. }`.
 - **Compressed input** — zstd-compressed documents are transparently
@@ -250,9 +275,12 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
 v1, by design (see [`DESIGN.md`](DESIGN.md) for the full non-goals):
 
 - **Lexical namespaces.** Element/attribute names are surfaced as written
-  (`QName`, prefix intact). Root-declared namespaces are captured in
-  `Prelude::namespaces` for manual resolution, but are not auto-applied per
-  event.
+  (`QName`, prefix intact). Root- and container-declared namespaces are captured
+  in `Prelude::namespaces` for manual resolution, but are not auto-applied per
+  event. `Prelude::namespaces` is a single shared context, so if `record_path`
+  matches **multiple** containers that redeclare the same prefix to *different*
+  URIs, the merge is last-writer-wins (a non-issue for uniform containers; root
+  and ancestor declarations are always correct).
 - **Whole document resident** on the `ParallelXml` path — workers need random
   access to their slices, so the document is read into a `Vec` or `mmap`'d. Use
   [`StreamReader`](#streaming-bounded-memory) for bounded-memory parallel
@@ -260,13 +288,14 @@ v1, by design (see [`DESIGN.md`](DESIGN.md) for the full non-goals):
 - **No external DTDs / parameter entities**, and no schema/DTD validation.
 - **Sequential Phase A.** The boundary scan is single-threaded (a speculative
   parallel scan is a possible future optimization).
-- Parallelism is at depth 1 only; nested content within a record is parsed
-  sequentially (fine for the uniform-records target).
+- Parallelism is at the record level — the root's direct children by default, or
+  the children of a container named via `record_path`. Content nested *within* a
+  record is parsed sequentially (fine for the uniform-records target).
 
 ## Development
 
 ```sh
-cargo test     # 34 unit tests across scan / parse / lib
+cargo test     # full unit + property suite across scan / parse / lib
 cargo build
 ```
 

@@ -14,9 +14,18 @@ pub enum Encoding {
     Utf8,
 }
 
-/// Namespace declarations (`xmlns` / `xmlns:prefix`) captured from the root or
-/// prolog and applied to every record. Declarations made *inside* a record are
-/// local and are not stored here.
+/// Namespace declarations (`xmlns` / `xmlns:prefix`) in effect for the records,
+/// captured from the root and from every element descended into on the way to
+/// the record container (see [`Config::record_path`](crate::Config::record_path)).
+/// Declarations made *inside* a record are local and are not stored here.
+///
+/// This is a single, flat context shared by all records (the [`Prelude`] is
+/// immutable and shared by design). When `record_path` matches **multiple**
+/// containers that redeclare the same prefix (or the default namespace) to
+/// *different* URIs, the merge is last-writer-wins — the context cannot hold a
+/// per-container scope. That is a non-issue for the uniform-records target (one
+/// container, or containers that agree on their declarations); root- and
+/// ancestor-declared namespaces are always correct.
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceContext {
     /// Prefix (empty string = default namespace) -> namespace URI.
@@ -41,7 +50,7 @@ impl NamespaceContext {
 }
 
 /// Immutable context shared across all workers (via `Arc`). Built once in Phase A.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Prelude {
     /// Resolved encoding of the source document.
     pub encoding: Encoding,

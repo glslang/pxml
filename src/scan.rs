@@ -50,21 +50,30 @@ impl ChunkIndex {
 
 /// Run the Phase A boundary scan over the whole document buffer.
 ///
+/// Frames the direct children of the container reached by following `path` — a
+/// sequence of qualified element names from the root down. An empty `path` means
+/// the root itself, so the records are the root's direct children (the default).
+///
 /// Algorithm (see `DESIGN.md`, "Phase A scanner"):
 /// 1. Parse the prolog (`<?xml?>`, optional `<!DOCTYPE>` with internal
 ///    `<!ENTITY>` defs); stop at the root start tag, capturing its namespace
 ///    declarations into the [`Prelude`].
-/// 2. With `depth == 1` inside the root, frame each depth-1 element: remember
-///    `start` on `depth 1 -> 2`, emit `start..cursor` when returning to depth 1.
+/// 2. Descend along `path` — skipping non-matching siblings and accumulating the
+///    descended elements' `xmlns` — to the container at `depth == path.len() + 1`,
+///    then frame each direct child: remember `start` when it opens, emit
+///    `start..cursor` when it closes.
 /// 3. Use `memchr` to jump between delimiters.
 /// 4. On EOF expect the root to be closed, else [`XmlError::Malformed`].
-pub fn scan(buf: &[u8]) -> Result<ChunkIndex, XmlError> {
-    Scanner { buf, pos: 0 }.run()
+pub fn scan_with(buf: &[u8], path: &[Box<str>]) -> Result<ChunkIndex, XmlError> {
+    Scanner { buf, pos: 0, path }.run()
 }
 
 struct Scanner<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Element-name path from the root to the record container (see
+    /// [`scan_with`]). Empty = the root is the container.
+    path: &'a [Box<str>],
 }
 
 impl<'a> Scanner<'a> {
@@ -74,11 +83,11 @@ impl<'a> Scanner<'a> {
         self.skip_prolog_misc(&mut entities)?;
 
         // Cursor is now at the root start tag's '<'.
-        let (root_name, namespaces, self_closing) = self.parse_root()?;
+        let (root_name, mut namespaces, self_closing) = self.parse_root()?;
 
         let mut records = Vec::new();
         if !self_closing {
-            self.scan_content(&mut records, root_name.as_bytes())?;
+            self.scan_content(&mut records, root_name.as_bytes(), &mut namespaces)?;
         }
         self.skip_trailing_misc()?;
 
@@ -208,77 +217,42 @@ impl<'a> Scanner<'a> {
             return Err(XmlError::Malformed(lt));
         }
         let root_name: Box<str> = utf8(name)?.into();
-        let (end, self_closing, namespaces) = self.parse_start_tag_attrs(j)?;
+        let mut namespaces = NamespaceContext::new();
+        let (end, self_closing) = self.parse_start_tag_attrs(j, &mut namespaces)?;
         self.pos = end;
         Ok((root_name, namespaces, self_closing))
     }
 
     /// Parse attributes from `i` (just after the element name) to the tag's `>`,
-    /// capturing `xmlns` / `xmlns:prefix` declarations. Returns the offset just
-    /// past `>`, whether the tag is self-closing, and the namespace context.
+    /// merging any `xmlns` / `xmlns:prefix` declarations into `ns`. Returns the
+    /// offset just past `>` and whether the tag is self-closing. Used for the
+    /// root and for every element descended into on the way to the container, so
+    /// their namespace declarations accumulate into one shared context.
     fn parse_start_tag_attrs(
         &self,
-        mut i: usize,
-    ) -> Result<(usize, bool, NamespaceContext), XmlError> {
-        let n = self.buf.len();
-        let mut ns = NamespaceContext::new();
-        loop {
-            skip_ws_at(self.buf, &mut i);
-            if i >= n {
-                return Err(XmlError::Malformed(i));
-            }
-            match self.buf[i] {
-                b'>' => return Ok((i + 1, false, ns)),
-                b'/' => {
-                    return if self.buf.get(i + 1) == Some(&b'>') {
-                        Ok((i + 2, true, ns))
-                    } else {
-                        Err(XmlError::Malformed(i))
-                    };
-                }
-                _ => {
-                    let astart = i;
-                    while i < n && is_name_char(self.buf[i]) {
-                        i += 1;
-                    }
-                    let aname = &self.buf[astart..i];
-                    if aname.is_empty() {
-                        return Err(XmlError::Malformed(i));
-                    }
-                    skip_ws_at(self.buf, &mut i);
-                    if i >= n || self.buf[i] != b'=' {
-                        return Err(XmlError::Malformed(i));
-                    }
-                    i += 1;
-                    skip_ws_at(self.buf, &mut i);
-                    if i >= n || (self.buf[i] != b'"' && self.buf[i] != b'\'') {
-                        return Err(XmlError::Malformed(i));
-                    }
-                    let q = self.buf[i];
-                    i += 1;
-                    let off = memchr(q, &self.buf[i..]).ok_or(XmlError::Malformed(i))?;
-                    let value = &self.buf[i..i + off];
-                    i += off + 1;
-
-                    if aname == b"xmlns" {
-                        ns.insert(utf8(b"")?, utf8(value)?);
-                    } else if let Some(prefix) = aname.strip_prefix(b"xmlns:") {
-                        ns.insert(utf8(prefix)?, utf8(value)?);
-                    }
-                }
-            }
-        }
+        i: usize,
+        ns: &mut NamespaceContext,
+    ) -> Result<(usize, bool), XmlError> {
+        scan_attrs_xmlns(self.buf, i, ns)
     }
 
     // --- Content framing --------------------------------------------------
 
-    /// Frame depth-1 records, starting with the cursor just past the root start
-    /// tag (`depth == 1`). Returns with the cursor just past the root end tag.
+    /// Frame the records — the direct children of the container reached by
+    /// following `self.path`. The cursor starts just past the root start tag
+    /// (`depth == 1`) and returns just past the root end tag.
+    ///
+    /// `target = path.len() + 1` is the depth at which records live (empty path
+    /// ⇒ `target == 1`, the root's children). At a descent level
+    /// (`depth < target`) the matching path step is descended into (accumulating
+    /// its `xmlns` into `namespaces`) and any other sibling is skipped whole.
     fn scan_content(
         &mut self,
         records: &mut Vec<Range<usize>>,
         root_name: &[u8],
+        namespaces: &mut NamespaceContext,
     ) -> Result<(), XmlError> {
+        let target = self.path.len() + 1;
         let mut depth: usize = 1;
         let mut record_start: Option<usize> = None;
 
@@ -287,8 +261,10 @@ impl<'a> Scanner<'a> {
                 Some(off) => self.pos + off,
                 None => return Err(XmlError::Malformed(self.pos)), // EOF before root close
             };
-            // Only whitespace is allowed directly under the root, between records.
-            if depth == 1 && !self.buf[self.pos..lt].iter().all(|&b| is_xml_ws(b)) {
+            // Between siblings at a descent / record-boundary level (i.e. when
+            // not inside a record) only whitespace is allowed. Inside a record
+            // the bytes belong to that record's slice.
+            if record_start.is_none() && !self.buf[self.pos..lt].iter().all(|&b| is_xml_ws(b)) {
                 return Err(XmlError::Malformed(self.pos));
             }
             self.pos = lt;
@@ -311,21 +287,88 @@ impl<'a> Scanner<'a> {
                     }
                     self.pos = end;
                     return Ok(());
-                } else if depth == 1 {
+                } else if record_start.is_some() && depth == target {
+                    // The current record's own end tag.
                     let start = record_start.take().ok_or(XmlError::Malformed(lt))?;
                     records.push(start..end);
                 }
+                // Otherwise a descent container closed (depth now < target, no
+                // record open) — nothing to emit; more siblings may follow.
                 self.pos = end;
             } else if rest.len() >= 2 && is_name_start(rest[1]) {
-                let (end, self_closing) = self.scan_start_tag(lt + 1)?;
-                if depth == 1 {
+                if record_start.is_some() {
+                    // Inside a record: track nesting only.
+                    let (end, self_closing) = self.scan_start_tag(lt + 1)?;
+                    if !self_closing {
+                        depth += 1;
+                    }
+                    self.pos = end;
+                } else if depth == target {
+                    // A record: a direct child of the container.
+                    let (end, self_closing) = self.scan_start_tag(lt + 1)?;
                     if self_closing {
                         records.push(lt..end); // complete one-tag record
                     } else {
                         record_start = Some(lt);
-                        depth = 2;
+                        depth += 1;
                     }
-                } else if !self_closing {
+                    self.pos = end;
+                } else {
+                    // A descent level. Descend into the element matching the
+                    // next path step; skip any other sibling wholesale.
+                    let name = end_tag_name(self.buf, lt + 1);
+                    if name == self.path[depth - 1].as_bytes() {
+                        let name_end = lt + 1 + name.len();
+                        // Merge this container's xmlns into the one shared context
+                        // (last-writer-wins across multiple matching containers —
+                        // see `NamespaceContext`; sound for uniform containers).
+                        let (end, self_closing) =
+                            self.parse_start_tag_attrs(name_end, namespaces)?;
+                        if !self_closing {
+                            depth += 1;
+                        }
+                        self.pos = end;
+                    } else {
+                        let (end, self_closing) = self.scan_start_tag(lt + 1)?;
+                        self.pos = end;
+                        if !self_closing {
+                            self.skip_subtree()?;
+                        }
+                    }
+                }
+            } else {
+                return Err(XmlError::Malformed(lt));
+            }
+        }
+    }
+
+    /// Skip a balanced element whose start tag has just been consumed (the
+    /// cursor is past its `>` and it was not self-closing). Leaves the cursor
+    /// just past the matching end tag. Lexical spans (comments / CDATA / PIs /
+    /// quoted attribute values) are honoured, so a record- or container-lookalike
+    /// buried in a skipped sibling can't confuse framing.
+    fn skip_subtree(&mut self) -> Result<(), XmlError> {
+        let mut depth: usize = 1;
+        while depth > 0 {
+            let lt = match memchr(b'<', &self.buf[self.pos..]) {
+                Some(off) => self.pos + off,
+                None => return Err(XmlError::Malformed(self.pos)),
+            };
+            self.pos = lt;
+            let rest = &self.buf[lt..];
+            if rest.starts_with(b"<!--") {
+                self.skip_comment()?;
+            } else if rest.starts_with(b"<![CDATA[") {
+                self.skip_cdata()?;
+            } else if rest.starts_with(b"<?") {
+                self.skip_pi()?;
+            } else if rest.starts_with(b"</") {
+                let end = self.scan_tag_end(lt + 2)?;
+                depth -= 1;
+                self.pos = end;
+            } else if rest.len() >= 2 && is_name_start(rest[1]) {
+                let (end, self_closing) = self.scan_start_tag(lt + 1)?;
+                if !self_closing {
                     depth += 1;
                 }
                 self.pos = end;
@@ -333,6 +376,7 @@ impl<'a> Scanner<'a> {
                 return Err(XmlError::Malformed(lt));
             }
         }
+        Ok(())
     }
 
     /// Allow only whitespace / comments / PIs between the root end tag and EOF.
@@ -418,13 +462,72 @@ fn is_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b':' | b'-' | b'.') || b >= 0x80
 }
 
-/// The name of an end tag, given the offset just past `</`.
+/// The name of a start or end tag, given the offset just past `<` / `</`.
 fn end_tag_name(buf: &[u8], start: usize) -> &[u8] {
     let mut j = start;
     while j < buf.len() && is_name_char(buf[j]) {
         j += 1;
     }
     &buf[start..j]
+}
+
+/// Scan a start tag's attributes from `i` (just past the element name) to its
+/// terminating `>` / `/>`, merging any `xmlns` / `xmlns:prefix` declarations
+/// into `ns`. Returns the offset just past the terminator and whether the tag is
+/// self-closing. Shared by the resident scanner (root + descent) and the
+/// streaming framer (descent), so namespace capture is identical in both.
+fn scan_attrs_xmlns(
+    buf: &[u8],
+    mut i: usize,
+    ns: &mut NamespaceContext,
+) -> Result<(usize, bool), XmlError> {
+    let n = buf.len();
+    loop {
+        skip_ws_at(buf, &mut i);
+        if i >= n {
+            return Err(XmlError::Malformed(i));
+        }
+        match buf[i] {
+            b'>' => return Ok((i + 1, false)),
+            b'/' => {
+                return if buf.get(i + 1) == Some(&b'>') {
+                    Ok((i + 2, true))
+                } else {
+                    Err(XmlError::Malformed(i))
+                };
+            }
+            _ => {
+                let astart = i;
+                while i < n && is_name_char(buf[i]) {
+                    i += 1;
+                }
+                let aname = &buf[astart..i];
+                if aname.is_empty() {
+                    return Err(XmlError::Malformed(i));
+                }
+                skip_ws_at(buf, &mut i);
+                if i >= n || buf[i] != b'=' {
+                    return Err(XmlError::Malformed(i));
+                }
+                i += 1;
+                skip_ws_at(buf, &mut i);
+                if i >= n || (buf[i] != b'"' && buf[i] != b'\'') {
+                    return Err(XmlError::Malformed(i));
+                }
+                let q = buf[i];
+                i += 1;
+                let off = memchr(q, &buf[i..]).ok_or(XmlError::Malformed(i))?;
+                let value = &buf[i..i + off];
+                i += off + 1;
+
+                if aname == b"xmlns" {
+                    ns.insert(utf8(b"")?, utf8(value)?);
+                } else if let Some(prefix) = aname.strip_prefix(b"xmlns:") {
+                    ns.insert(utf8(prefix)?, utf8(value)?);
+                }
+            }
+        }
+    }
 }
 
 fn is_xml_ws(b: u8) -> bool {
@@ -868,10 +971,25 @@ pub(crate) struct StreamFramer {
     next_index: usize,
     finished: bool,
     root_name: Box<str>,
+    /// Element-name path from the root to the record container (see
+    /// [`scan_with`]); empty = the root is the container.
+    path: Box<[Box<str>]>,
+    /// Depth at which records live: `path.len() + 1`.
+    target: usize,
+    /// Nesting depth inside a non-matching sibling being skipped whole; `0` when
+    /// not skipping. Never entered when `target == 1` (no descent levels).
+    skip_depth: usize,
+    /// Shared prelude, seeded from the root by [`try_prelude`](Self::try_prelude)
+    /// and augmented with each descended container's `xmlns`.
+    prelude: Option<Arc<Prelude>>,
 }
 
 impl StreamFramer {
-    pub(crate) fn new() -> Self {
+    /// Build a framer that frames the direct children of the container reached
+    /// by following `path` (see [`scan_with`]). An empty `path` = the root's
+    /// direct children.
+    pub(crate) fn with_path(path: Vec<Box<str>>) -> Self {
+        let target = path.len() + 1;
         Self {
             carry: Vec::new(),
             base: 0,
@@ -883,6 +1001,10 @@ impl StreamFramer {
             next_index: 0,
             finished: false,
             root_name: Box::default(),
+            path: path.into_boxed_slice(),
+            target,
+            skip_depth: 0,
+            prelude: None,
         }
     }
 
@@ -903,10 +1025,104 @@ impl StreamFramer {
                     self.depth = 0;
                 }
                 self.root_name = p.prelude.root_name.clone();
-                Ok(Some(Arc::new(p.prelude)))
+                let prelude = Arc::new(p.prelude);
+                self.prelude = Some(prelude.clone());
+                Ok(Some(prelude))
             }
             None => Ok(None),
         }
+    }
+
+    /// The current shared prelude — the root's, augmented with the `xmlns` of
+    /// every container descended into so far. Cloning is cheap (`Arc`). Only
+    /// valid after [`try_prelude`](Self::try_prelude) has succeeded.
+    pub(crate) fn prelude(&self) -> Arc<Prelude> {
+        self.prelude
+            .clone()
+            .expect("prelude() called before try_prelude() succeeded")
+    }
+
+    /// At a descent level (`self.depth < self.target`), whether the start tag at
+    /// `tag_start` names the element expected by the next path step.
+    fn descent_name_matches(&self) -> bool {
+        let name = end_tag_name(&self.carry, self.tag_start - self.base + 1);
+        name == self.path[self.depth - 1].as_bytes()
+    }
+
+    /// Merge a just-completed descended container's `xmlns` declarations (the
+    /// tag at `tag_start`) into the shared prelude. The whole start tag is in
+    /// `carry` (we scanned to its `>`), so this reads it directly.
+    fn capture_descent_xmlns(&mut self) -> Result<(), XmlError> {
+        let name_end = end_tag_name(&self.carry, self.tag_start - self.base + 1).len()
+            + (self.tag_start - self.base + 1);
+        let mut prelude = (*self.prelude()).clone();
+        scan_attrs_xmlns(&self.carry, name_end, &mut prelude.namespaces)?;
+        self.prelude = Some(Arc::new(prelude));
+        Ok(())
+    }
+
+    /// Apply the framing rule to a just-completed tag (both framer variants share
+    /// this). `end` is the offset just past its `>`. Returns `Some((start, end))`
+    /// when a record must be emitted. This generalizes the depth-1 framing to a
+    /// container at `self.target`, with descent (skip non-matching siblings,
+    /// match path steps, capture `xmlns`) at shallower levels — and reduces to
+    /// the depth-1 behaviour when `target == 1` (no descent levels).
+    fn on_tag_complete(
+        &mut self,
+        is_end: bool,
+        self_closing: bool,
+        end: usize,
+    ) -> Result<Option<(usize, usize)>, XmlError> {
+        // Inside a non-matching sibling being skipped whole: track nesting only.
+        if self.skip_depth > 0 {
+            if is_end {
+                self.skip_depth -= 1;
+            } else if !self_closing {
+                self.skip_depth += 1;
+            }
+            return Ok(None);
+        }
+
+        if is_end {
+            self.depth = self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
+            if self.depth == 0 {
+                if !self.root_close_ok() {
+                    return Err(XmlError::Malformed(end));
+                }
+                self.finished = true;
+            } else if self.depth == self.target {
+                // The current record's own end tag.
+                let start = self.record_start.take().ok_or(XmlError::Malformed(end))?;
+                return Ok(Some((start, end)));
+            }
+            // else: a descent container closed (depth < target) — nothing to emit.
+            return Ok(None);
+        }
+
+        // A start tag.
+        if self.record_start.is_some() {
+            // Inside a record: track nesting (self-closing adds none).
+            if !self_closing {
+                self.depth += 1;
+            }
+        } else if self.depth == self.target {
+            // A record: a direct child of the container.
+            if self_closing {
+                return Ok(Some((self.tag_start, end)));
+            }
+            self.record_start = Some(self.tag_start);
+            self.depth += 1;
+        } else if self.descent_name_matches() {
+            // Descend into the element matching the next path step.
+            self.capture_descent_xmlns()?;
+            if !self_closing {
+                self.depth += 1;
+            }
+        } else if !self_closing {
+            // A non-matching sibling: skip its whole subtree.
+            self.skip_depth = 1;
+        }
+        Ok(None)
     }
 
     /// Drop already-consumed bytes so resident memory stays bounded.
@@ -985,7 +1201,9 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
-                        if self.depth == 1 && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        if self.record_start.is_none()
+                            && self.skip_depth == 0
+                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
                         {
                             return Err(XmlError::Malformed(self.base + i));
                         }
@@ -994,7 +1212,10 @@ impl StreamFramer {
                         self.state = Cs::Lt;
                     }
                     None => {
-                        if self.depth == 1 && !self.carry[i..].iter().all(|&b| is_xml_ws(b)) {
+                        if self.record_start.is_none()
+                            && self.skip_depth == 0
+                            && !self.carry[i..].iter().all(|&b| is_xml_ws(b))
+                        {
                             return Err(XmlError::Malformed(self.base + i));
                         }
                         i = n;
@@ -1134,30 +1355,9 @@ impl StreamFramer {
                         let end = self.base + i + 1;
                         i += 1;
                         self.state = Cs::Text;
-                        if is_end {
-                            self.depth =
-                                self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
-                            if self.depth == 0 {
-                                if !self.root_close_ok() {
-                                    return Err(XmlError::Malformed(end));
-                                }
-                                self.finished = true;
-                            } else if self.depth == 1 {
-                                let start =
-                                    self.record_start.take().ok_or(XmlError::Malformed(end))?;
-                                self.cursor = end;
-                                return Ok(Some(self.emit(arena, start, end)));
-                            }
-                        } else if prev_slash {
-                            if self.depth == 1 {
-                                self.cursor = end;
-                                return Ok(Some(self.emit(arena, self.tag_start, end)));
-                            }
-                        } else if self.depth == 1 {
-                            self.record_start = Some(self.tag_start);
-                            self.depth = 2;
-                        } else {
-                            self.depth += 1;
+                        if let Some((start, end)) = self.on_tag_complete(is_end, prev_slash, end)? {
+                            self.cursor = end;
+                            return Ok(Some(self.emit(arena, start, end)));
                         }
                     } else if b == b'/' {
                         self.state = Cs::Tag {
@@ -1197,7 +1397,9 @@ impl StreamFramer {
             match self.state {
                 Cs::Text => match memchr(b'<', &self.carry[i..]) {
                     Some(off) => {
-                        if self.depth == 1 && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
+                        if self.record_start.is_none()
+                            && self.skip_depth == 0
+                            && !self.carry[i..i + off].iter().all(|&b| is_xml_ws(b))
                         {
                             return Err(XmlError::Malformed(self.base + i));
                         }
@@ -1206,7 +1408,10 @@ impl StreamFramer {
                         self.state = Cs::Lt;
                     }
                     None => {
-                        if self.depth == 1 && !self.carry[i..].iter().all(|&b| is_xml_ws(b)) {
+                        if self.record_start.is_none()
+                            && self.skip_depth == 0
+                            && !self.carry[i..].iter().all(|&b| is_xml_ws(b))
+                        {
                             return Err(XmlError::Malformed(self.base + i));
                         }
                         i = n;
@@ -1317,28 +1522,9 @@ impl StreamFramer {
                     let self_closing = !is_end && pos > 0 && self.carry[pos - 1] == b'/';
                     i = pos + 1;
                     self.state = Cs::Text;
-                    if is_end {
-                        self.depth = self.depth.checked_sub(1).ok_or(XmlError::Malformed(end))?;
-                        if self.depth == 0 {
-                            if !self.root_close_ok() {
-                                return Err(XmlError::Malformed(end));
-                            }
-                            self.finished = true;
-                        } else if self.depth == 1 {
-                            let start = self.record_start.take().ok_or(XmlError::Malformed(end))?;
-                            self.cursor = end;
-                            return Ok(Some(self.emit(arena, start, end)));
-                        }
-                    } else if self_closing {
-                        if self.depth == 1 {
-                            self.cursor = end;
-                            return Ok(Some(self.emit(arena, self.tag_start, end)));
-                        }
-                    } else if self.depth == 1 {
-                        self.record_start = Some(self.tag_start);
-                        self.depth = 2;
-                    } else {
-                        self.depth += 1;
+                    if let Some((start, end)) = self.on_tag_complete(is_end, self_closing, end)? {
+                        self.cursor = end;
+                        return Ok(Some(self.emit(arena, start, end)));
                     }
                 }
             }
@@ -1375,6 +1561,21 @@ impl StreamFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scan with the default (empty) path — the root's direct children.
+    fn scan(buf: &[u8]) -> Result<ChunkIndex, XmlError> {
+        scan_with(buf, &[])
+    }
+
+    /// Scan under `path` and return each framed record as an owned `String`.
+    fn frames_under(input: &str, path: &[&str]) -> Vec<String> {
+        let path: Vec<Box<str>> = path.iter().map(|s| (*s).into()).collect();
+        let idx = scan_with(input.as_bytes(), &path).expect("scan should succeed");
+        idx.records()
+            .iter()
+            .map(|r| String::from_utf8(input.as_bytes()[r.clone()].to_vec()).unwrap())
+            .collect()
+    }
 
     /// Scan `input` and return each framed record as an owned `String`.
     fn frames(input: &str) -> Vec<String> {
@@ -1530,6 +1731,112 @@ mod tests {
         assert_eq!(frames("<späm><ítem/></späm>"), vec!["<ítem/>"]);
     }
 
+    // --- Container descent (record_path) ----------------------------------
+
+    #[test]
+    fn empty_path_matches_root_children() {
+        // An empty path is exactly the default: the root's direct children.
+        assert_eq!(frames_under("<r><a/><b/></r>", &[]), vec!["<a/>", "<b/>"]);
+    }
+
+    #[test]
+    fn container_descent_skips_siblings() {
+        assert_eq!(
+            frames_under(
+                "<root><manifest>m</manifest>\
+                 <objects><object>0</object><object>1</object></objects>\
+                 <footer/></root>",
+                &["objects"],
+            ),
+            vec!["<object>0</object>", "<object>1</object>"],
+        );
+    }
+
+    #[test]
+    fn container_children_keep_their_nesting() {
+        assert_eq!(
+            frames_under(
+                "<root><objects><object><id>1</id><v x=\"2\"/></object></objects></root>",
+                &["objects"],
+            ),
+            vec!["<object><id>1</id><v x=\"2\"/></object>"],
+        );
+    }
+
+    #[test]
+    fn container_descent_multi_level_path() {
+        assert_eq!(
+            frames_under(
+                "<root><meta/><body><note/><objects><object/><object/></objects></body></root>",
+                &["body", "objects"],
+            ),
+            vec!["<object/>", "<object/>"],
+        );
+    }
+
+    #[test]
+    fn container_absent_yields_no_records() {
+        assert!(frames_under("<root><manifest/></root>", &["objects"]).is_empty());
+    }
+
+    #[test]
+    fn self_closing_container_yields_no_records() {
+        assert!(frames_under("<root><objects/></root>", &["objects"]).is_empty());
+    }
+
+    #[test]
+    fn multiple_containers_frame_all_children() {
+        assert_eq!(
+            frames_under(
+                "<root><objects><a/></objects><manifest/><objects><b/><c/></objects></root>",
+                &["objects"],
+            ),
+            vec!["<a/>", "<b/>", "<c/>"],
+        );
+    }
+
+    #[test]
+    fn skipped_sibling_may_hold_text_and_container_lookalikes() {
+        // <manifest> holds free text and a nested <objects> that must NOT be
+        // descended into — only the real depth-1 <objects> is a container.
+        assert_eq!(
+            frames_under(
+                "<root><manifest>free &amp; text <objects><nope/></objects></manifest>\
+                 <objects><object/></objects></root>",
+                &["objects"],
+            ),
+            vec!["<object/>"],
+        );
+    }
+
+    #[test]
+    fn container_and_ancestor_xmlns_captured_into_prelude() {
+        let path: Vec<Box<str>> = vec!["body".into(), "objects".into()];
+        let idx = scan_with(
+            br#"<root xmlns:a="urn:a"><body xmlns:b="urn:b"><objects xmlns:p="urn:p"><p:object/></objects></body></root>"#,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(idx.len(), 1);
+        let ns = &idx.prelude().namespaces;
+        assert_eq!(ns.resolve("a"), Some("urn:a"), "root decl");
+        assert_eq!(ns.resolve("b"), Some("urn:b"), "ancestor decl");
+        assert_eq!(ns.resolve("p"), Some("urn:p"), "container decl");
+    }
+
+    #[test]
+    fn non_whitespace_text_at_container_level_is_rejected() {
+        let path: Vec<Box<str>> = vec!["objects".into()];
+        assert!(
+            scan_with(b"<root><objects>junk<object/></objects></root>", &path).is_err(),
+            "text directly inside the container is rejected",
+        );
+        assert!(
+            scan_with(b"<root>junk<objects><object/></objects></root>", &path).is_err(),
+            "text directly under root is rejected",
+        );
+    }
+
     #[test]
     fn malformed_inputs_error() {
         assert!(scan(b"").is_err(), "empty");
@@ -1572,7 +1879,13 @@ mod tests {
 
     /// Record byte-ranges per the materialized scanner, as strings.
     fn materialized(input: &[u8]) -> Vec<String> {
-        let idx = scan(input).unwrap();
+        materialized_under(input, &[])
+    }
+
+    /// Materialized records under `path`, as strings.
+    fn materialized_under(input: &[u8], path: &[&str]) -> Vec<String> {
+        let path: Vec<Box<str>> = path.iter().map(|s| (*s).into()).collect();
+        let idx = scan_with(input, &path).unwrap();
         idx.records()
             .iter()
             .map(|r| String::from_utf8(input[r.clone()].to_vec()).unwrap())
@@ -1581,7 +1894,13 @@ mod tests {
 
     /// Drive the streaming framer feeding `chunk` bytes at a time.
     fn stream_frame(input: &[u8], chunk: usize) -> Vec<String> {
-        let mut framer = StreamFramer::new();
+        stream_frame_under(input, chunk, &[])
+    }
+
+    /// Drive the streaming framer under `path`, feeding `chunk` bytes at a time.
+    fn stream_frame_under(input: &[u8], chunk: usize, path: &[&str]) -> Vec<String> {
+        let path: Vec<Box<str>> = path.iter().map(|s| (*s).into()).collect();
+        let mut framer = StreamFramer::with_path(path);
         let mut fed = 0;
         loop {
             if framer.try_prelude().unwrap().is_some() {
@@ -1638,8 +1957,88 @@ mod tests {
     }
 
     #[test]
+    fn streaming_framer_matches_materialized_under_path() {
+        // (document, path) pairs exercising skip / descend / trailing siblings /
+        // multiple containers / nested container-lookalikes / container xmlns.
+        let cases: &[(&[u8], &[&str])] = &[
+            (
+                b"<root><manifest>m</manifest><objects><object>0</object><object>1</object></objects><footer/></root>",
+                &["objects"],
+            ),
+            (b"<root><meta/><body><objects><o/><o/></objects></body></root>", &["body", "objects"]),
+            (b"<root><objects><a/></objects><objects><b/><c/></objects></root>", &["objects"]),
+            (b"<root><objects/></root>", &["objects"]),
+            (b"<root><manifest/></root>", &["objects"]),
+            (
+                b"<root><manifest>t <objects><nope/></objects></manifest><objects><object/></objects></root>",
+                &["objects"],
+            ),
+            (
+                br#"<root><objects xmlns:p="urn:p"><p:object x="1 > 0"/></objects></root>"#,
+                &["objects"],
+            ),
+        ];
+        for (input, path) in cases {
+            let expected = materialized_under(input, path);
+            for &chunk in &[1usize, 2, 3, 5, 7, 13, 1000] {
+                let got = stream_frame_under(input, chunk, path);
+                assert_eq!(
+                    got,
+                    expected,
+                    "input={:?} path={path:?} chunk={chunk}",
+                    std::str::from_utf8(input).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_framer_skips_large_sibling_bounded() {
+        // A huge non-matching sibling subtree between the root open and the
+        // container. Its bytes are skipped, so the carry must stay bounded.
+        let mut input = String::from("<root><manifest><blob>");
+        input.push_str(&"x".repeat(100_000));
+        input.push_str("</blob></manifest><objects><object/></objects></root>");
+        let bytes = input.as_bytes();
+
+        let path: Vec<Box<str>> = vec!["objects".into()];
+        let mut framer = StreamFramer::with_path(path);
+        let mut fed = 0;
+        let feed = |framer: &mut StreamFramer, fed: &mut usize| {
+            let end = (*fed + 64).min(bytes.len());
+            framer.push(&bytes[*fed..end]);
+            *fed = end;
+        };
+        while framer.try_prelude().unwrap().is_none() {
+            feed(&mut framer, &mut fed);
+        }
+
+        let mut arena = Vec::new();
+        let mut max_carry = 0;
+        let mut records = 0;
+        loop {
+            while framer.next_record_into(&mut arena).unwrap().is_some() {
+                records += 1;
+            }
+            framer.compact();
+            max_carry = max_carry.max(framer.carry.len());
+            if fed >= bytes.len() {
+                framer.finish().unwrap();
+                break;
+            }
+            feed(&mut framer, &mut fed);
+        }
+
+        assert_eq!(records, 1, "the single <object/> record");
+        assert!(
+            max_carry < 1024,
+            "carry grew to {max_carry} bytes; the 100 KB sibling was retained"
+        );
+    }
+
+    #[test]
     fn streaming_framer_indices_are_sequential() {
-        let mut framer = StreamFramer::new();
+        let mut framer = StreamFramer::with_path(Vec::new());
         framer.push(b"<r><a/><b/><c/></r>");
         assert!(framer.try_prelude().unwrap().is_some());
         let mut arena = Vec::new();
@@ -1653,7 +2052,7 @@ mod tests {
     /// Drive the streaming framer over a whole input; return the first error
     /// (framing or end-of-stream).
     fn stream_result(input: &[u8]) -> Result<(), XmlError> {
-        let mut f = StreamFramer::new();
+        let mut f = StreamFramer::with_path(Vec::new());
         f.push(input);
         if f.try_prelude()?.is_none() {
             return Err(XmlError::Malformed(0));
@@ -1696,7 +2095,7 @@ mod tests {
         input.push_str("--><a/></r>");
         let bytes = input.as_bytes();
 
-        let mut framer = StreamFramer::new();
+        let mut framer = StreamFramer::with_path(Vec::new());
         let mut fed = 0;
         let feed = |framer: &mut StreamFramer, fed: &mut usize| {
             let end = (*fed + 64).min(bytes.len());
@@ -1778,6 +2177,31 @@ mod tests {
             })
     }
 
+    /// A document whose records live inside an `objects` container, surrounded by
+    /// skippable sibling elements. The container name (7 chars) can't collide
+    /// with the 1–4 char generated element names, so siblings are never mistaken
+    /// for the container.
+    fn arb_container_doc() -> impl Strategy<Value = String> {
+        let siblings = || prop::collection::vec(("[ \n\t]{0,2}", arb_element()), 0..3);
+        (
+            siblings(),
+            prop::collection::vec(("[ \n\t]{0,2}", arb_element()), 0..4),
+            "[ \n\t]{0,2}",
+            siblings(),
+        )
+            .prop_map(|(lead, recs, ws, trail)| {
+                let join = |v: Vec<(String, String)>| -> String {
+                    v.into_iter().map(|(w, e)| format!("{w}{e}")).collect()
+                };
+                format!(
+                    "<root>{}<objects>{}{ws}</objects>{}</root>",
+                    join(lead),
+                    join(recs),
+                    join(trail),
+                )
+            })
+    }
+
     proptest! {
         /// The streaming framer frames the same records as the materialized
         /// scanner, for any chunk size — the chunked unit test's property,
@@ -1794,6 +2218,19 @@ mod tests {
             prop_assert_eq!(stream_frame(bytes, chunk), expected);
         }
 
+        /// The same property under a container path: the streaming framer, when
+        /// descending into `objects` and skipping siblings, frames exactly what
+        /// the materialized scanner does.
+        #[test]
+        fn streaming_matches_materialized_under_path_prop(
+            doc in arb_container_doc(),
+            chunk in 1usize..40,
+        ) {
+            let bytes = doc.as_bytes();
+            let expected = materialized_under(bytes, &["objects"]);
+            prop_assert_eq!(stream_frame_under(bytes, chunk, &["objects"]), expected);
+        }
+
         /// Neither the materialized scanner nor the streaming framer panics on
         /// arbitrary bytes — they may return `Err`, but never index out of
         /// bounds or overflow.
@@ -1801,7 +2238,7 @@ mod tests {
         fn never_panics_on_arbitrary_bytes(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
             let _ = scan(&bytes);
 
-            let mut framer = StreamFramer::new();
+            let mut framer = StreamFramer::with_path(Vec::new());
             framer.push(&bytes);
             if let Ok(Some(_)) = framer.try_prelude() {
                 let mut arena = Vec::new();
