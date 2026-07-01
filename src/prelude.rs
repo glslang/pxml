@@ -41,7 +41,7 @@ impl NamespaceContext {
 }
 
 /// Immutable context shared across all workers (via `Arc`). Built once in Phase A.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Prelude {
     /// Resolved encoding of the source document.
     pub encoding: Encoding,

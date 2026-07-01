@@ -15,13 +15,14 @@
 
 use std::io::Read;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
 use rayon::iter::{ParallelBridge, ParallelIterator};
 
 use crate::scan::StreamFramer;
-use crate::{Record, XmlError};
+use crate::{Prelude, Record, XmlError};
 
 /// Bytes pulled from the source per read.
 const CHUNK: usize = 64 * 1024;
@@ -32,10 +33,13 @@ const CHUNK: usize = 64 * 1024;
 const BATCH: usize = 256;
 
 /// A batch of framed records sharing one arena allocation. `records` holds each
-/// record's document index and its byte span within `data`.
+/// record's document index and its byte span within `data`. `prelude` is the
+/// shared context as of when the batch was framed — carried per batch so a
+/// container's `xmlns`, captured during descent, reaches the workers.
 struct Batch {
     data: Vec<u8>,
     records: Vec<(usize, Range<usize>)>,
+    prelude: Arc<Prelude>,
 }
 
 /// A streaming, bounded-memory parser over a (decompressing) byte source.
@@ -45,6 +49,10 @@ struct Batch {
 /// [`par_for_each`](StreamReader::par_for_each).
 pub struct StreamReader<'a> {
     reader: Box<dyn Read + Send + 'a>,
+    /// Element-name path from the root to the record container (see
+    /// [`ParallelXml::record_path`](crate::ParallelXml::record_path)); empty =
+    /// the root's direct children.
+    record_path: Vec<Box<str>>,
 }
 
 impl<'a> StreamReader<'a> {
@@ -52,6 +60,7 @@ impl<'a> StreamReader<'a> {
     pub fn from_reader<R: Read + Send + 'a>(reader: R) -> Self {
         Self {
             reader: Box::new(reader),
+            record_path: Vec::new(),
         }
     }
 
@@ -61,7 +70,21 @@ impl<'a> StreamReader<'a> {
         let decoder = zstd::Decoder::new(reader)?;
         Ok(Self {
             reader: Box::new(decoder),
+            record_path: Vec::new(),
         })
+    }
+
+    /// Frame the direct children of the container reached by following `path`,
+    /// skipping non-matching siblings — the streaming counterpart of
+    /// [`ParallelXml::record_path`](crate::ParallelXml::record_path). Empty =
+    /// the root's direct children (the default).
+    pub fn record_path<I, S>(mut self, path: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Box<str>>,
+    {
+        self.record_path = path.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Frame records on a producer thread and apply `f` to each in parallel,
@@ -78,21 +101,23 @@ impl<'a> StreamReader<'a> {
         F: Fn(&Record) + Sync,
     {
         let mut reader = self.reader;
-        let mut framer = StreamFramer::new();
+        let mut framer = StreamFramer::with_path(self.record_path);
         let mut chunk = vec![0u8; CHUNK];
 
-        // Parse the prolog on this thread before splitting into producer/workers,
-        // so the shared prelude is known before any record is dispatched.
-        let prelude = loop {
-            if let Some(prelude) = framer.try_prelude()? {
-                break prelude;
+        // Parse the prolog on this thread before splitting into producer/workers.
+        // The prelude is carried per batch (the framer augments it as it descends
+        // into a container), so the base returned here is only used to detect a
+        // prolog error / drive the loop.
+        loop {
+            if framer.try_prelude()?.is_some() {
+                break;
             }
             let n = reader.read(&mut chunk).map_err(XmlError::Io)?;
             if n == 0 {
                 return Err(XmlError::Malformed(0)); // no root element
             }
             framer.push(&chunk[..n]);
-        };
+        }
 
         let capacity = (rayon::current_num_threads() * 2).max(1);
         let (tx, rx) = sync_channel::<Batch>(capacity);
@@ -114,8 +139,20 @@ impl<'a> StreamReader<'a> {
                             }
                         }
                     }
-                    if !records.is_empty() && tx.send(Batch { data, records }).is_err() {
-                        return Ok(()); // consumer dropped
+                    if !records.is_empty() {
+                        // Read the prelude after framing, so it reflects any
+                        // container `xmlns` captured while producing this batch.
+                        let prelude = framer.prelude();
+                        if tx
+                            .send(Batch {
+                                data,
+                                records,
+                                prelude,
+                            })
+                            .is_err()
+                        {
+                            return Ok(()); // consumer dropped
+                        }
                     }
                     if need_more {
                         framer.compact();
@@ -133,7 +170,8 @@ impl<'a> StreamReader<'a> {
             // bounded channel throttles the producer when the pool is saturated.
             rx.into_iter().par_bridge().for_each(|batch| {
                 for (index, span) in &batch.records {
-                    let record = Record::new(&batch.data[span.clone()], prelude.clone(), *index);
+                    let record =
+                        Record::new(&batch.data[span.clone()], batch.prelude.clone(), *index);
                     f(&record);
                 }
             });
@@ -226,6 +264,40 @@ mod tests {
     fn streaming_reports_unclosed_root() {
         let res = StreamReader::from_reader(&b"<r><a></a>"[..]).par_for_each(|_| {});
         assert!(res.is_err());
+    }
+
+    /// `<root><manifest>meta</manifest><objects><object>0</object>…</objects></root>`.
+    fn build_container_doc(n: usize) -> String {
+        let mut s = String::from("<root><manifest>meta</manifest><objects>");
+        for i in 0..n {
+            s.push_str("<object>");
+            s.push_str(&i.to_string());
+            s.push_str("</object>");
+        }
+        s.push_str("</objects></root>");
+        s
+    }
+
+    #[test]
+    fn streaming_record_path_matches_materialized() {
+        let n = 500;
+        let xml = build_container_doc(n);
+        let got =
+            collect_sorted(StreamReader::from_reader(xml.as_bytes()).record_path(["objects"]));
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn streaming_record_path_survives_tiny_chunks() {
+        let n = 40;
+        let xml = build_container_doc(n);
+        let reader = Chunky {
+            data: xml.as_bytes(),
+            pos: 0,
+            step: 3,
+        };
+        let got = collect_sorted(StreamReader::from_reader(reader).record_path(["objects"]));
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
     }
 
     #[cfg(feature = "zstd")]

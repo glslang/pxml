@@ -439,6 +439,48 @@ char-ref interleavings.
 
 ---
 
+## 18. Records under a nested container (`record_path`)
+
+**Context.** The record model assumed the records are the root's direct children
+(`<trades><trade/>…</trades>`). Real documents often wrap the uniform records one
+or more levels down, next to sibling nodes that should be ignored:
+`<root><manifest/><objects><object/>…</objects></root>`. Callers wanted to skip
+the siblings and parallelise the container's children.
+
+**Decision.** Add `Config::record_path` (and `ParallelXml::record_path` /
+`StreamReader::record_path` builders): an element-name path from the root to the
+**container** whose direct children are the records. Empty (the default) = the
+root, i.e. today's behaviour. Framing generalises to a single rule with
+`target = path.len() + 1`: while not inside a record, an element at `depth <
+target` is *descended into* if its name matches the next path step (its `xmlns`
+is accumulated into the shared `Prelude`) or its whole subtree is *skipped* if it
+doesn't; elements at `depth == target` are records. This provably reduces to the
+old depth-1 framing when `target == 1`, so the default path is unchanged.
+Children of *every* matching container are framed, and leading/trailing siblings
+are skipped, because matching is re-evaluated each time framing returns to a
+descent level. A container name nested inside a skipped sibling is never matched
+(the sibling is skipped whole).
+
+**Why.** Naming the *container* (rather than the repeated record element)
+generalises the existing "root is the container" model with the least new
+concept: the rule "records = the container's direct children" is unchanged; only
+the container moves. Skipping non-matching siblings falls out for free.
+
+**Consequences.** The resident scanner (`scan_with`) accumulates ancestor +
+container `xmlns` into the `Prelude` for correct isolated parsing. The streaming
+framer applies the same rule in both variants (default and `memchr-framer`),
+gated so `target == 1` is byte-identical: descent name-matching and `xmlns`
+capture happen at tag completion (the whole start tag is in `carry`); a
+`skip_depth` counter skips non-matching subtrees using the existing incremental
+machinery, so a huge skipped sibling stays carry-bounded (tested). Because a
+container's `xmlns` is discovered mid-stream, the streaming `Prelude` is carried
+**per batch** (`Batch { …, prelude }`) rather than fixed before the
+producer/worker split. A property test asserts the streaming framer frames the
+same records as the resident scanner under a container path, over generated
+documents with leading/trailing siblings.
+
+---
+
 ## Future work
 
 - **Reduce streaming overhead further.** Batching + arena are done (15); a

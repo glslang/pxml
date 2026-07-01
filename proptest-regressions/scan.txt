@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 4ed92b654e109fca7e361736cbc7e2d3b42cdfdca127dc03db6dbcf7c4e1b836 # shrinks to bytes = [0, 0]
+cc caea96c4f7375da9a58cd45b4dff3f751ed733b6db5ab1cfd99169b131c3f9d8 # shrinks to doc = "<root><objects></objects><a><a>.</a></a></root>", chunk = 1

@@ -141,9 +141,25 @@ impl ParallelXml {
         self
     }
 
+    /// Set the [`record_path`](Config::record_path): the element-name path from
+    /// the root to the container whose direct children are the records.
+    ///
+    /// Sibling nodes that don't match are skipped. For example, given
+    /// `<root><manifest/><objects><object/>…</objects></root>`,
+    /// `.record_path(["objects"])` frames the `<object>` children, skipping
+    /// `<manifest>`.
+    pub fn record_path<I, S>(mut self, path: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Box<str>>,
+    {
+        self.config.record_path = path.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Phase A only — cheap; exposes record count / framing.
     pub fn index(&self) -> Result<ChunkIndex, XmlError> {
-        scan::scan(self.buf.as_slice())
+        scan::scan_with(self.buf.as_slice(), &self.config.record_path)
     }
 
     /// Unordered parallel map over records (the natural "any order" API).
@@ -154,7 +170,7 @@ impl ParallelXml {
         F: Fn(&Record) + Sync,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan(buf)?;
+        let index = scan::scan_with(buf, &self.config.record_path)?;
         let prelude = &index.prelude;
         let make = |i: usize, r: &Range<usize>| Record {
             bytes: &buf[r.clone()],
@@ -182,7 +198,7 @@ impl ParallelXml {
         F: Fn(&Record) -> T + Sync,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan(buf)?;
+        let index = scan::scan_with(buf, &self.config.record_path)?;
         let prelude = &index.prelude;
         let make = |i: usize, r: &Range<usize>| Record {
             bytes: &buf[r.clone()],
@@ -219,7 +235,7 @@ impl ParallelXml {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan(buf)?;
+        let index = scan::scan_with(buf, &self.config.record_path)?;
         let prelude = &index.prelude;
         let one = |i: usize, r: &Range<usize>| {
             let rec = Record {
@@ -264,7 +280,7 @@ impl ParallelXml {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan(buf)?;
+        let index = scan::scan_with(buf, &self.config.record_path)?;
         let prelude = &index.prelude;
         let one = |i: usize, r: &Range<usize>| {
             let rec = Record {
@@ -535,7 +551,50 @@ mod tests {
         Config {
             parallel_threshold: 0,
             min_records: 0,
+            ..Config::default()
         }
+    }
+
+    /// `<root><manifest>meta</manifest><objects><object>0</object>…</objects></root>`
+    /// — records wrapped one level down, alongside a sibling to be skipped.
+    fn build_container_doc(n: usize) -> String {
+        let mut s = String::from("<root><manifest>meta</manifest><objects>");
+        for i in 0..n {
+            s.push_str("<object>");
+            s.push_str(&i.to_string());
+            s.push_str("</object>");
+        }
+        s.push_str("</objects></root>");
+        s
+    }
+
+    #[test]
+    fn record_path_frames_container_children_in_order() {
+        let n = 2000;
+        let px = ParallelXml::from_bytes(build_container_doc(n).into_bytes())
+            .with_config(force_parallel())
+            .record_path(["objects"]);
+        let got: Vec<usize> = px
+            .map_collect(|rec| record_text(rec).parse().unwrap())
+            .unwrap();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn record_path_sequential_fallback_matches_parallel() {
+        let n = 100; // small: default config takes the sequential fallback
+        let xml = build_container_doc(n);
+        let seq: Vec<usize> = ParallelXml::from_bytes(xml.clone().into_bytes())
+            .record_path(["objects"])
+            .map_collect(|rec| record_text(rec).parse().unwrap())
+            .unwrap();
+        let par: Vec<usize> = ParallelXml::from_bytes(xml.into_bytes())
+            .with_config(force_parallel())
+            .record_path(["objects"])
+            .map_collect(|rec| record_text(rec).parse().unwrap())
+            .unwrap();
+        assert_eq!(seq, par);
+        assert_eq!(seq, (0..n).collect::<Vec<_>>());
     }
 
     #[test]

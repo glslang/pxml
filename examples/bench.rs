@@ -125,6 +125,7 @@ fn parallel_config() -> Config {
     Config {
         parallel_threshold: 0,
         min_records: 0,
+        ..Config::default()
     }
 }
 
@@ -132,6 +133,7 @@ fn sequential_config() -> Config {
     Config {
         parallel_threshold: usize::MAX,
         min_records: usize::MAX,
+        ..Config::default()
     }
 }
 
