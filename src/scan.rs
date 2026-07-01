@@ -319,6 +319,9 @@ impl<'a> Scanner<'a> {
                     let name = end_tag_name(self.buf, lt + 1);
                     if name == self.path[depth - 1].as_bytes() {
                         let name_end = lt + 1 + name.len();
+                        // Merge this container's xmlns into the one shared context
+                        // (last-writer-wins across multiple matching containers —
+                        // see `NamespaceContext`; sound for uniform containers).
                         let (end, self_closing) =
                             self.parse_start_tag_attrs(name_end, namespaces)?;
                         if !self_closing {

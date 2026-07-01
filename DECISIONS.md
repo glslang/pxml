@@ -466,6 +466,19 @@ generalises the existing "root is the container" model with the least new
 concept: the rule "records = the container's direct children" is unchanged; only
 the container moves. Skipping non-matching siblings falls out for free.
 
+**Namespace scope is flat (accepted limitation).** The `Prelude` holds one
+shared, immutable `NamespaceContext` (decision 6), so a descended container's
+`xmlns` is *merged* into it rather than scoped per container. When `record_path`
+matches multiple containers that redeclare the same prefix (or the default
+namespace) to different URIs — `<objects xmlns:p="urn:1">…</objects><objects
+xmlns:p="urn:2">…</objects>` — every record sees the last-writer-wins value, not
+its own container's. Per-container scoping would require per-record preludes,
+which contradicts the shared-`Prelude` architecture; the multi-container-conflict
+case is outside the uniform-records target (where containers agree on their
+declarations, or there is only one). Root- and ancestor-declared namespaces — the
+common case — are always correct. This is consistent with namespaces already being
+a lexical, best-effort, manual-resolution facility in v1 (decision 5).
+
 **Consequences.** The resident scanner (`scan_with`) accumulates ancestor +
 container `xmlns` into the `Prelude` for correct isolated parsing. The streaming
 framer applies the same rule in both variants (default and `memchr-framer`),

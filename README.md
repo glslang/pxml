@@ -128,6 +128,9 @@ children of *every* matching container are framed, and it works on the streaming
 path too (`StreamReader::from_reader(r).record_path(["objects"])`). An empty path
 (the default) means the root itself.
 
+The container's namespace declarations are merged into the one shared `Prelude`
+context (see [Limitations](#limitations) for the multi-container caveat).
+
 ### Compressed input
 
 With the default `zstd` feature, `from_path` transparently decompresses a
@@ -272,9 +275,12 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
 v1, by design (see [`DESIGN.md`](DESIGN.md) for the full non-goals):
 
 - **Lexical namespaces.** Element/attribute names are surfaced as written
-  (`QName`, prefix intact). Root-declared namespaces are captured in
-  `Prelude::namespaces` for manual resolution, but are not auto-applied per
-  event.
+  (`QName`, prefix intact). Root- and container-declared namespaces are captured
+  in `Prelude::namespaces` for manual resolution, but are not auto-applied per
+  event. `Prelude::namespaces` is a single shared context, so if `record_path`
+  matches **multiple** containers that redeclare the same prefix to *different*
+  URIs, the merge is last-writer-wins (a non-issue for uniform containers; root
+  and ancestor declarations are always correct).
 - **Whole document resident** on the `ParallelXml` path — workers need random
   access to their slices, so the document is read into a `Vec` or `mmap`'d. Use
   [`StreamReader`](#streaming-bounded-memory) for bounded-memory parallel
