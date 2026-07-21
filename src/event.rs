@@ -18,9 +18,17 @@ use crate::prelude::Prelude;
 pub enum Event<'a> {
     /// An element start tag and its attributes. Self-closing elements are
     /// surfaced as a `Start` immediately followed by an `End`.
-    Start { name: QName<'a>, attrs: Attrs<'a> },
+    Start {
+        /// The element's qualified name, as written (may include a `prefix:`).
+        name: QName<'a>,
+        /// The start tag's attributes; iterate with [`Attrs::iter`].
+        attrs: Attrs<'a>,
+    },
     /// An element end tag.
-    End { name: QName<'a> },
+    End {
+        /// The element's qualified name, as written (may include a `prefix:`).
+        name: QName<'a>,
+    },
     /// Character data, entity-decoded (predefined + prelude entities).
     Text(Cow<'a, str>),
     /// A `<![CDATA[ … ]]>` section, surfaced raw (never entity-decoded).

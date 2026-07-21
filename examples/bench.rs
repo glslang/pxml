@@ -122,19 +122,13 @@ fn drive(px: &ParallelXml) -> u64 {
 }
 
 fn parallel_config() -> Config {
-    Config {
-        parallel_threshold: 0,
-        min_records: 0,
-        ..Config::default()
-    }
+    Config::new().with_parallel_threshold(0).with_min_records(0)
 }
 
 fn sequential_config() -> Config {
-    Config {
-        parallel_threshold: usize::MAX,
-        min_records: usize::MAX,
-        ..Config::default()
-    }
+    Config::new()
+        .with_parallel_threshold(usize::MAX)
+        .with_min_records(usize::MAX)
 }
 
 fn build(data: &[u8], config: Config) -> ParallelXml {
@@ -170,13 +164,13 @@ fn report(
 fn fallback_demo() {
     let small = generate(8);
     let cfg = Config::default();
-    let to_sequential = small.len() < cfg.parallel_threshold || 8 < cfg.min_records;
+    let to_sequential = small.len() < cfg.parallel_threshold() || 8 < cfg.min_records();
     println!(
         "\nsmall-input fallback: 8 records / {} bytes vs defaults \
          (parallel_threshold = {} bytes, min_records = {}) -> sequential = {to_sequential}",
         small.len(),
-        cfg.parallel_threshold,
-        cfg.min_records,
+        cfg.parallel_threshold(),
+        cfg.min_records(),
     );
     black_box(drive(&ParallelXml::from_bytes(small)));
 }

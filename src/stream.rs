@@ -47,12 +47,56 @@ struct Batch {
 /// Build one with [`StreamReader::from_reader`] or
 /// [`StreamReader::from_zstd_reader`], then drive it with
 /// [`par_for_each`](StreamReader::par_for_each).
+///
+/// Use this instead of [`ParallelXml`](crate::ParallelXml) when the document
+/// does not comfortably fit in memory — typically a multi-GB *compressed* file,
+/// which cannot be mmap'd in its decompressed form. Resident memory is bounded
+/// by the in-flight records (≈ `threads × record size`) plus one chunk,
+/// independent of document size.
+///
+/// ```
+/// use pxml::{Event, StreamReader};
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+///
+/// // Any `Read` source — a File, a socket, or here a plain byte slice.
+/// let xml = &b"<trades><trade>1</trade><trade>2</trade></trades>"[..];
+/// let total = AtomicUsize::new(0);
+///
+/// StreamReader::from_reader(xml).par_for_each(|record| {
+///     let mut events = record.events();
+///     while let Some(ev) = events.next_event().unwrap() {
+///         if let Event::Text(t) = ev {
+///             total.fetch_add(t.parse::<usize>().unwrap(), Ordering::Relaxed);
+///         }
+///     }
+/// })?;
+///
+/// assert_eq!(total.load(Ordering::Relaxed), 3);
+/// # Ok::<(), pxml::XmlError>(())
+/// ```
+///
+/// # Trade-offs vs. the resident path
+///
+/// Records arrive **unordered** and are **owned** (copied out of the decode
+/// buffer rather than borrowed from it), so there is no streaming equivalent of
+/// [`map_collect`](crate::ParallelXml::map_collect). In exchange memory is
+/// constant, and on large documents throughput is often *better*, because the
+/// pipeline overlaps decompression with parsing and keeps each batch
+/// cache-resident.
 pub struct StreamReader<'a> {
     reader: Box<dyn Read + Send + 'a>,
     /// Element-name path from the root to the record container (see
-    /// [`ParallelXml::record_path`](crate::ParallelXml::record_path)); empty =
+    /// [`Config::with_record_path`](crate::Config::with_record_path)); empty =
     /// the root's direct children.
     record_path: Vec<Box<str>>,
+}
+
+impl std::fmt::Debug for StreamReader<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamReader")
+            .field("record_path", &self.record_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> StreamReader<'a> {
@@ -66,6 +110,7 @@ impl<'a> StreamReader<'a> {
 
     /// Stream over a zstd-compressed byte source, decompressing incrementally.
     #[cfg(feature = "zstd")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
     pub fn from_zstd_reader<R: Read + Send + 'a>(reader: R) -> std::io::Result<Self> {
         let decoder = zstd::Decoder::new(reader)?;
         Ok(Self {
@@ -76,8 +121,11 @@ impl<'a> StreamReader<'a> {
 
     /// Frame the direct children of the container reached by following `path`,
     /// skipping non-matching siblings — the streaming counterpart of
-    /// [`ParallelXml::record_path`](crate::ParallelXml::record_path). Empty =
+    /// [`Config::with_record_path`](crate::Config::with_record_path). Empty =
     /// the root's direct children (the default).
+    ///
+    /// `StreamReader` takes no [`Config`](crate::Config) (the parallelism
+    /// thresholds only apply to the resident path), so the path is set here.
     pub fn record_path<I, S>(mut self, path: I) -> Self
     where
         I: IntoIterator<Item = S>,

@@ -1,9 +1,11 @@
 # pxml
 
+[![crates.io](https://img.shields.io/crates/v/pxml.svg)](https://crates.io/crates/pxml)
+[![docs.rs](https://docs.rs/pxml/badge.svg)](https://docs.rs/pxml)
 [![CI](https://github.com/glslang/pxml/actions/workflows/ci.yml/badge.svg)](https://github.com/glslang/pxml/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/glslang/pxml/graph/badge.svg)](https://codecov.io/gh/glslang/pxml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 [![edition 2024](https://img.shields.io/badge/edition-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
 A parallel, **StAX-style (pull) XML reader** for Rust, built for one shape of
@@ -28,7 +30,7 @@ attribute value, comment, CDATA section, or processing instruction.
 
 `pxml` resolves both problems with a **two-phase, scan-then-parse** design:
 
-```
+```text
             ┌─────────────────────── whole document (Vec or mmap) ──────────────────────┐
 Phase A     │ <?xml?> <!DOCTYPE…> <trades>  <trade>…</trade> <trade>…</trade>  </trades> │
 (sequential)│ └──────── prelude ────────┘   └── record 0 ──┘ └── record 1 ──┘            │
@@ -51,12 +53,12 @@ Phase B (parallel, rayon): record 0 ─▶ worker        record 1 ─▶ worker 
 
 ```toml
 [dependencies]
-pxml = { path = "." } # or a version once published
+pxml = "0.1"
 ```
 
-Requires a toolchain with **edition 2024** support (Rust 1.85+).
+Requires **Rust 1.88+** (edition 2024, plus let-chains used by the scanner).
 
-```rust
+```rust,no_run
 use pxml::{Event, ParallelXml};
 use std::path::Path;
 
@@ -72,12 +74,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Event::Start { name, attrs } => {
                     if name.as_ref() == b"trade" {
                         for attr in attrs.iter() {
+                            // key: &[u8], value: Cow<str> (entity-decoded)
                             let attr = attr.unwrap();
-                            // attr.key: &[u8], attr.value: Cow<str> (entity-decoded)
+                            println!("{:?} = {}", attr.key, attr.value);
                         }
                     }
                 }
-                Event::Text(text) => { /* … */ }
+                Event::Text(text) => println!("text: {text}"),
                 _ => {}
             }
         }
@@ -91,11 +94,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `map_collect` runs in parallel but slots results back into **document order**:
 
 ```rust
-// `doc: ParallelXml`, inside a function returning `Result<_, XmlError>`
+# use pxml::ParallelXml;
+# let doc = ParallelXml::from_bytes(&b"<rs><r>a</r><r>b</r></rs>"[..]);
 let values: Vec<u64> = doc.map_collect(|record| {
     // parse the record and return a typed value
     record.index() as u64
 })?;
+assert_eq!(values, [0, 1]);
+# Ok::<(), pxml::XmlError>(())
 ```
 
 ### Just the framing
@@ -104,29 +110,42 @@ let values: Vec<u64> = doc.map_collect(|record| {
 without parsing anything:
 
 ```rust
+# use pxml::ParallelXml;
+# let doc = ParallelXml::from_bytes(&b"<rs><r>a</r><r>b</r></rs>"[..]);
 let idx = doc.index()?; // Phase A only
 println!("{} records", idx.len());
+assert_eq!(idx.records()[0], 4..12); // byte range of `<r>a</r>`
+# Ok::<(), pxml::XmlError>(())
 ```
 
 ### Records under a nested container
 
 By default the records are the root's direct children. When they instead live
 inside a wrapper element — alongside siblings that should be ignored — name the
-container with `record_path`. `pxml` skips the non-matching siblings, descends
-into the container (accumulating any `xmlns` it declares), and frames its direct
-children:
+container with `Config::with_record_path`. `pxml` skips the non-matching
+siblings, descends into the container (accumulating any `xmlns` it declares),
+and frames its direct children:
 
 ```rust
-// <root><manifest>…</manifest><objects><object/><object/>…</objects></root>
-let doc = ParallelXml::from_path(Path::new("assets.xml"))?
-    .record_path(["objects"]); // skip <manifest>, frame each <object>
-let count = doc.index()?.len();
+# use pxml::{Config, ParallelXml};
+let xml = b"<root><manifest>meta</manifest>\
+            <objects><object/><object/></objects></root>".to_vec();
+
+// skip <manifest>, frame each <object>
+let config = Config::new().with_record_path(["objects"]);
+
+let doc = ParallelXml::from_bytes(xml).with_config(config);
+assert_eq!(doc.index()?.len(), 2);
+# Ok::<(), pxml::XmlError>(())
 ```
 
-The path may descend several levels (`.record_path(["body", "objects"])`), the
-children of *every* matching container are framed, and it works on the streaming
-path too (`StreamReader::from_reader(r).record_path(["objects"])`). An empty path
-(the default) means the root itself.
+The path may descend several levels (`.with_record_path(["body", "objects"])`),
+and the children of *every* matching container are framed. An empty path (the
+default) means the root itself.
+
+The streaming reader takes no `Config` — the parallelism thresholds only apply
+to the resident path — so it sets the path directly:
+`StreamReader::from_reader(r).record_path(["objects"])`.
 
 The container's namespace declarations are merged into the one shared `Prelude`
 context (see [Limitations](#limitations) for the multi-container caveat).
@@ -137,11 +156,19 @@ With the default `zstd` feature, `from_path` transparently decompresses a
 zstd-compressed document (detected by its magic number); plain XML is mmap'd as
 usual. For in-memory or streamed compressed data:
 
-```rust
+```rust,no_run
+# // Gated so this block still compiles with --no-default-features.
+# #[cfg(feature = "zstd")]
+# fn demo() -> Result<(), pxml::XmlError> {
+use pxml::ParallelXml;
 use std::fs::File;
 
+# let compressed: Vec<u8> = Vec::new();
+# let path = "trades.xml.zst";
 let doc = ParallelXml::from_zstd_bytes(&compressed)?;        // &[u8]
 let doc = ParallelXml::from_zstd_reader(File::open(path)?)?; // any Read
+# Ok(())
+# }
 ```
 
 The whole document is decompressed up front (workers need random access to
@@ -160,14 +187,23 @@ parallel, with a bounded channel providing backpressure. Resident memory is
 bounded by the in-flight records (≈ `threads × record size`) plus one chunk —
 **independent of document size**.
 
-```rust
+```rust,no_run
+# // Gated so this block still compiles with --no-default-features.
+# #[cfg(feature = "zstd")]
+# fn demo() -> Result<(), Box<dyn std::error::Error>> {
 use pxml::StreamReader;
 use std::fs::File;
 
 StreamReader::from_zstd_reader(File::open("trades.xml.zst")?)?
     .par_for_each(|record| {
         // drive record.events(); results arrive unordered
+        let mut events = record.events();
+        while let Some(ev) = events.next_event().unwrap() {
+            // …
+        }
     })?;
+# Ok(())
+# }
 ```
 
 `from_reader(impl Read)` streams an already-decompressed source. Records are
@@ -208,15 +244,21 @@ Below `Config::parallel_threshold` bytes **or** `Config::min_records` records,
 both `par_for_each` and `map_collect` transparently run a sequential pass — the
 thread-pool and indexing overhead doesn't repay itself on small inputs.
 
+`Config` is built with chained `with_*` methods:
+
 ```rust
 use pxml::{Config, ParallelXml};
 
-let doc = ParallelXml::from_bytes(bytes).with_config(Config {
-    parallel_threshold: 1 << 20, // 1 MiB
-    min_records: 32,
-    ..Config::default()
-});
+# let bytes = b"<rs><r>a</r></rs>".to_vec();
+let config = Config::new()
+    .with_parallel_threshold(1 << 20) // 1 MiB
+    .with_min_records(32);
+
+let doc = ParallelXml::from_bytes(bytes).with_config(config);
 ```
+
+Its fields are private, so a future release can add a knob without breaking
+callers. Read them back with the matching getters (`config.min_records()`).
 
 Defaults: `parallel_threshold = 4 MiB`, `min_records = 64`.
 
@@ -274,6 +316,18 @@ bounded-memory *and* ~2.2× faster than resident on a large file).
 
 v1, by design (see [`DESIGN.md`](DESIGN.md) for the full non-goals):
 
+- **Records must be order-independent.** This is the load-bearing assumption: a
+  worker sees only its own record, so cross-record state — an accumulator, a
+  lookup into an earlier record, anything positional beyond `record.index()` —
+  is not available during the parallel pass. If your records are *not*
+  independent, use `doc.sequential()` (a classic whole-document StAX cursor) and
+  skip the parallelism.
+- **`try_map_collect` does not short-circuit on the parallel path.** Building an
+  ordered `Vec<T>` means visiting every record, so the closure still runs for
+  records after a failing one, and when several fail, which error surfaces is
+  not deterministic. Use `try_par_for_each` when you need early termination.
+  (The sequential fallback *does* stop at the first error — so this differs
+  between small and large inputs.)
 - **Lexical namespaces.** Element/attribute names are surfaced as written
   (`QName`, prefix intact). Root- and container-declared namespaces are captured
   in `Prelude::namespaces` for manual resolution, but are not auto-applied per

@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`pxml` is a parallel, StAX-style (pull) XML reader for Rust (edition 2024, Rust 1.85+),
+`pxml` is a parallel, StAX-style (pull) XML reader for Rust (edition 2024, Rust 1.88+),
 specialized for one document shape: a single root containing thousands of
 **uniform, order-independent records** (e.g. `<trades><trade>…</trade>…</trades>`).
 The records may be the root's direct children (default) or the children of a
-nested container named via `Config::record_path` (e.g. the `<object>`s in
+nested container named via `Config::with_record_path` (e.g. the `<object>`s in
 `<root><manifest/><objects><object/>…</objects></root>`).
 It is a library crate, not a binary.
 
@@ -41,7 +41,7 @@ attribute value, comment, CDATA, PI, or DTD. So work is split in two:
 
 - **Phase A — boundary scan (`src/scan.rs`, single-threaded).** A hand-written
   `memchr`-driven state machine walks the buffer once to find the record
-  boundaries — the direct children of the root, or, when `Config::record_path`
+  boundaries — the direct children of the root, or, when a record path
   is set, of a container reached by descending that element-name path (skipping
   non-matching siblings). It builds no tree, decodes no entities, and validates
   only structural well-formedness (depth, matching root end-tag, whitespace-only
