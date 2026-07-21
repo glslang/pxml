@@ -68,6 +68,53 @@ jobs:
       - name: clippy (no default features)
         run: cargo clippy --all-targets --no-default-features
 
+  msrv:
+    name: msrv (rust-version in Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["rust_version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # Build only: the declared MSRV must compile the library and its examples.
+      # Dev-dependencies may legitimately require a newer toolchain.
+      - name: Build at MSRV
+        run: cargo build --all-features
+
+  docs:
+    name: docs (rustdoc warnings are errors)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs
+        run: cargo doc --no-deps --all-features
+
+  package:
+    name: package (crates.io readiness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches missing manifest metadata, excluded-but-needed files, and a
+      # package that does not build from its own tarball.
+      - name: Verify publishable
+        run: cargo publish --dry-run
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

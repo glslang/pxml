@@ -36,6 +36,15 @@ pub struct RecordReader<'doc> {
     index: usize,
 }
 
+impl std::fmt::Debug for RecordReader<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordReader")
+            .field("index", &self.index)
+            .field("position", &self.reader.buffer_position())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'doc> RecordReader<'doc> {
     /// Build a reader over a single record's slice with shared prolog context.
     /// `index` is the record's position in document order, used to tag errors.

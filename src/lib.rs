@@ -1,18 +1,82 @@
-//! pxml — a parallel, StAX-style XML reader.
+//! pxml — a parallel, StAX-style (pull) XML reader.
 //!
-//! Two-phase architecture: a cheap, single-threaded **boundary scan** (Phase A,
-//! [`scan`]) frames the top-level records of a document and captures shared
-//! prolog context, then an embarrassingly-parallel **per-record parse**
-//! (Phase B, [`parse`]) runs on `rayon`. The soundness assumption is that
-//! top-level elements (direct children of the root) are independent and may be
+//! `pxml` targets one shape of document: a single root containing **thousands of
+//! uniform, order-independent records** — e.g. `<trades><trade>…</trade>…</trades>`.
+//!
+//! Two-phase architecture: a cheap, single-threaded **boundary scan** (Phase A)
+//! frames the records and captures shared prolog context, then an
+//! embarrassingly-parallel **per-record parse** (Phase B) runs on `rayon`. The
+//! soundness assumption is that the framed records are independent and may be
 //! consumed in any order.
 //!
-//! See `DESIGN.md` for the full feasibility study and design spec.
+//! # Quick start
 //!
-//! # Status
+//! Parse in parallel, collecting results back into document order:
 //!
-//! v1 complete: two-phase scan-then-parse is implemented, tested, and benchmarked.
-//! See `README.md`, `DESIGN.md`, and `DECISIONS.md`.
+//! ```
+//! use pxml::{Event, ParallelXml};
+//!
+//! let xml = b"<trades><trade id='1'/><trade id='2'/></trades>".to_vec();
+//! let doc = ParallelXml::from_bytes(xml);
+//!
+//! let ids: Vec<String> = doc.map_collect(|record| {
+//!     let mut events = record.events();
+//!     let mut id = String::new();
+//!     while let Some(ev) = events.next_event().unwrap() {
+//!         if let Event::Start { attrs, .. } = ev {
+//!             for attr in attrs.iter() {
+//!                 let attr = attr.unwrap();
+//!                 if attr.key == b"id" {
+//!                     id = attr.value.into_owned();
+//!                 }
+//!             }
+//!         }
+//!     }
+//!     id
+//! })?;
+//!
+//! assert_eq!(ids, ["1", "2"]);
+//! # Ok::<(), pxml::XmlError>(())
+//! ```
+//!
+//! # Choosing an entry point
+//!
+//! | Need | Use |
+//! |------|-----|
+//! | A file or in-memory buffer, results in document order | [`ParallelXml::map_collect`] |
+//! | A file or in-memory buffer, order irrelevant | [`ParallelXml::par_for_each`] |
+//! | The fallible variants (closure returns `Result`) | [`ParallelXml::try_map_collect`] / [`ParallelXml::try_par_for_each`] |
+//! | Record count / byte ranges only, no parsing | [`ParallelXml::index`] |
+//! | Bounded memory over a huge or compressed stream | [`StreamReader`] |
+//! | A classic whole-document StAX cursor | [`ParallelXml::sequential`] |
+//!
+//! Records that are not the root's direct children — e.g. the `<object>`s in
+//! `<root><manifest/><objects><object/>…</objects></root>` — are reached by
+//! setting [`Config::with_record_path`] and passing it to
+//! [`ParallelXml::with_config`].
+//!
+//! # Limitations
+//!
+//! Records must be **order-independent**: a worker sees only its own record, so
+//! cross-record state (an accumulator, a reference to an earlier record) is not
+//! available during the parallel pass. External DTDs and parameter entities are
+//! rejected with [`XmlError::UnsupportedDtd`]; non-UTF-8 input is rejected with
+//! [`XmlError::Encoding`].
+//!
+//! The design rationale is in `DESIGN.md`; the decisions and trade-offs actually
+//! made are in `DECISIONS.md`, which supersedes it.
+
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
+// docs.rs builds with `--cfg docsrs` (see Cargo.toml) so feature-gated items are
+// labelled with the feature that enables them. No effect on a stable build.
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+/// Compiles every Rust block in `README.md` as a doctest, so the front-page
+/// examples cannot drift from the API.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
 
 mod config;
 mod event;
@@ -63,6 +127,25 @@ impl Buffer {
             Buffer::Owned(b) => b,
             Buffer::Mmap(m) => m,
         }
+    }
+
+    /// How the bytes are held, for `Debug` output.
+    fn kind(&self) -> &'static str {
+        match self {
+            Buffer::Owned(_) => "owned",
+            Buffer::Mmap(_) => "mmap",
+        }
+    }
+}
+
+// Documents are large; `Debug` summarizes rather than dumping the buffer.
+impl fmt::Debug for ParallelXml {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParallelXml")
+            .field("buffer", &self.buf.kind())
+            .field("len", &self.buf.as_slice().len())
+            .field("config", &self.config)
+            .finish()
     }
 }
 
@@ -115,6 +198,7 @@ impl ParallelXml {
     /// document is decompressed up front. Decompression is sequential and adds
     /// to the serial fraction (see `DESIGN.md`).
     #[cfg(feature = "zstd")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
     pub fn from_zstd_reader(reader: impl std::io::Read) -> Result<Self, XmlError> {
         let bytes = zstd::decode_all(reader).map_err(XmlError::Io)?;
         Ok(Self::from_owned(bytes))
@@ -122,6 +206,7 @@ impl ParallelXml {
 
     /// Decompress a zstd-compressed document from an in-memory buffer.
     #[cfg(feature = "zstd")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "zstd")))]
     pub fn from_zstd_bytes(compressed: &[u8]) -> Result<Self, XmlError> {
         Self::from_zstd_reader(compressed)
     }
@@ -135,36 +220,76 @@ impl ParallelXml {
         }
     }
 
-    /// Override the default [`Config`].
+    /// Override the default [`Config`] — the single place to set both the
+    /// parallelism thresholds and the [record path](Config::with_record_path).
+    ///
+    /// Replaces the whole configuration rather than merging into it.
+    ///
+    /// ```
+    /// use pxml::{Config, ParallelXml};
+    ///
+    /// let xml = b"<root><manifest>meta</manifest>\
+    ///             <objects><object/><object/><object/></objects></root>".to_vec();
+    ///
+    /// // By default the records are the root's direct children:
+    /// // <manifest> and <objects>.
+    /// assert_eq!(ParallelXml::from_bytes(xml.clone()).index()?.len(), 2);
+    ///
+    /// // With a record path, <manifest> is skipped and each <object> is a record.
+    /// let doc = ParallelXml::from_bytes(xml)
+    ///     .with_config(Config::new().with_record_path(["objects"]));
+    /// assert_eq!(doc.index()?.len(), 3);
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
     pub fn with_config(mut self, cfg: Config) -> Self {
         self.config = cfg;
         self
     }
 
-    /// Set the [`record_path`](Config::record_path): the element-name path from
-    /// the root to the container whose direct children are the records.
-    ///
-    /// Sibling nodes that don't match are skipped. For example, given
-    /// `<root><manifest/><objects><object/>…</objects></root>`,
-    /// `.record_path(["objects"])` frames the `<object>` children, skipping
-    /// `<manifest>`.
-    pub fn record_path<I, S>(mut self, path: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<Box<str>>,
-    {
-        self.config.record_path = path.into_iter().map(Into::into).collect();
-        self
-    }
-
     /// Phase A only — cheap; exposes record count / framing.
+    ///
+    /// Runs the boundary scan without parsing any record, so it is a fast way to
+    /// count records or to get their byte ranges for custom dispatch.
+    ///
+    /// ```
+    /// use pxml::ParallelXml;
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>a</r><r>b</r></rs>"[..]);
+    /// let idx = doc.index()?;
+    ///
+    /// assert_eq!(idx.len(), 2);
+    /// assert_eq!(idx.records()[0], 4..12); // the bytes of `<r>a</r>`
+    /// assert_eq!(idx.prelude().root_name.as_ref(), "rs");
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
     pub fn index(&self) -> Result<ChunkIndex, XmlError> {
         scan::scan_with(self.buf.as_slice(), &self.config.record_path)
     }
 
     /// Unordered parallel map over records (the natural "any order" API).
     ///
-    /// Falls back to a sequential pass for small inputs (see [`Config`]).
+    /// Falls back to a sequential pass for small inputs (see [`Config`]). The
+    /// closure must be `Sync`, so shared state needs a lock or an atomic.
+    ///
+    /// ```
+    /// use pxml::{Event, ParallelXml};
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>a</r><r>b</r><r>c</r></rs>"[..]);
+    /// let seen = AtomicUsize::new(0);
+    ///
+    /// doc.par_for_each(|record| {
+    ///     let mut events = record.events();
+    ///     while let Some(ev) = events.next_event().unwrap() {
+    ///         if matches!(ev, Event::Text(_)) {
+    ///             seen.fetch_add(1, Ordering::Relaxed);
+    ///         }
+    ///     }
+    /// })?;
+    ///
+    /// assert_eq!(seen.load(Ordering::Relaxed), 3);
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
     pub fn par_for_each<F>(&self, f: F) -> Result<(), XmlError>
     where
         F: Fn(&Record) + Sync,
@@ -265,12 +390,38 @@ impl ParallelXml {
 
     /// Like [`map_collect`](Self::map_collect), but the closure returns a
     /// `Result`. On success the output is in document order; a record failure is
-    /// wrapped as [`XmlError::RecordError`]`{ index, source }`.
+    /// wrapped as [`XmlError::RecordError`]`{ index, source }` carrying the
+    /// failing record's position.
     ///
-    /// Short-circuiting differs by path: the **sequential fallback** stops at the
-    /// first error, but the **parallel path does not** — because building an
-    /// ordered `Vec<T>` means processing every record, rayon runs the closure for
-    /// all records and then returns one of the resulting errors. Use
+    /// ```
+    /// use pxml::{Event, ParallelXml, XmlError};
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>1</r><r>oops</r></rs>"[..]);
+    ///
+    /// let res = doc.try_map_collect(|record| {
+    ///     let mut events = record.events();
+    ///     let mut text = String::new();
+    ///     while let Some(ev) = events.next_event()? {
+    ///         if let Event::Text(t) = ev {
+    ///             text.push_str(&t);
+    ///         }
+    ///     }
+    ///     text.parse::<u32>()
+    ///         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    /// });
+    ///
+    /// // The index identifies which record failed.
+    /// assert!(matches!(res, Err(XmlError::RecordError { index: 1, .. })));
+    /// ```
+    ///
+    /// # Short-circuiting differs by path
+    ///
+    /// The **sequential fallback** stops at the first error, but the **parallel
+    /// path does not** — because building an ordered `Vec<T>` means processing
+    /// every record, rayon runs the closure for all records and then returns one
+    /// of the resulting errors. Two consequences: the closure may be called for
+    /// records after a failing one, and when several records fail, *which* error
+    /// surfaces is not deterministic. Use
     /// [`try_par_for_each`](Self::try_par_for_each) when you need early
     /// termination rather than a collected result.
     pub fn try_map_collect<T, F, E>(&self, f: F) -> Result<Vec<T>, XmlError>
@@ -318,6 +469,27 @@ impl ParallelXml {
 
     /// Escape hatch: a plain sequential StAX reader over the whole document
     /// (for classic-StAX consumers). Cheap to create — no Phase A scan.
+    ///
+    /// Unlike the record API this surfaces *every* element, including the root.
+    /// Use it when records are not order-independent, or when you want a
+    /// conventional single-cursor reader.
+    ///
+    /// ```
+    /// use pxml::{Event, ParallelXml};
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>a</r></rs>"[..]);
+    /// let mut reader = doc.sequential();
+    ///
+    /// let mut names = Vec::new();
+    /// while let Some(ev) = reader.next_event()? {
+    ///     if let Event::Start { name, .. } = ev {
+    ///         names.push(String::from_utf8(name.as_ref().to_vec()).unwrap());
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(names, ["rs", "r"]); // the root is included
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
     pub fn sequential(&self) -> SeqReader<'_> {
         SeqReader::new(self.buf.as_slice())
     }
@@ -348,6 +520,34 @@ impl<'doc> Record<'doc> {
     pub fn index(&self) -> usize {
         self.index
     }
+
+    /// This record's raw, undecoded bytes — the exact slice framed by Phase A,
+    /// from its start tag through its end tag.
+    ///
+    /// Useful for forwarding a record verbatim (to a queue, or to another
+    /// parser) without walking its events.
+    ///
+    /// ```
+    /// use pxml::ParallelXml;
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>a</r><r>b</r></rs>"[..]);
+    /// let raw: Vec<Vec<u8>> = doc.map_collect(|rec| rec.as_bytes().to_vec())?;
+    ///
+    /// assert_eq!(raw[0], b"<r>a</r>");
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
+    pub fn as_bytes(&self) -> &'doc [u8] {
+        self.bytes
+    }
+}
+
+impl fmt::Debug for Record<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Record")
+            .field("index", &self.index)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// A sequential StAX reader over the whole document — the classic-StAX entry
@@ -366,6 +566,14 @@ pub struct SeqReader<'doc> {
     /// Holds the lazily-captured entity map (and otherwise-empty context) used
     /// to resolve entity references via the shared event mapper.
     prelude: Prelude,
+}
+
+impl fmt::Debug for SeqReader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SeqReader")
+            .field("position", &self.reader.buffer_position())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'doc> SeqReader<'doc> {
@@ -480,7 +688,10 @@ pub enum XmlError {
     UnsupportedDtd,
     /// A failure parsing a single record (Phase B); carries its document index.
     RecordError {
+        /// The failing record's position in document order.
         index: usize,
+        /// The underlying failure — a parse error, or an error returned by the
+        /// user's closure from one of the `try_*` drivers.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -548,11 +759,7 @@ mod tests {
 
     /// Config that forces the parallel path regardless of input size.
     fn force_parallel() -> Config {
-        Config {
-            parallel_threshold: 0,
-            min_records: 0,
-            ..Config::default()
-        }
+        Config::new().with_parallel_threshold(0).with_min_records(0)
     }
 
     /// `<root><manifest>meta</manifest><objects><object>0</object>…</objects></root>`
@@ -572,8 +779,7 @@ mod tests {
     fn record_path_frames_container_children_in_order() {
         let n = 2000;
         let px = ParallelXml::from_bytes(build_container_doc(n).into_bytes())
-            .with_config(force_parallel())
-            .record_path(["objects"]);
+            .with_config(force_parallel().with_record_path(["objects"]));
         let got: Vec<usize> = px
             .map_collect(|rec| record_text(rec).parse().unwrap())
             .unwrap();
@@ -585,12 +791,11 @@ mod tests {
         let n = 100; // small: default config takes the sequential fallback
         let xml = build_container_doc(n);
         let seq: Vec<usize> = ParallelXml::from_bytes(xml.clone().into_bytes())
-            .record_path(["objects"])
+            .with_config(Config::new().with_record_path(["objects"]))
             .map_collect(|rec| record_text(rec).parse().unwrap())
             .unwrap();
         let par: Vec<usize> = ParallelXml::from_bytes(xml.into_bytes())
-            .with_config(force_parallel())
-            .record_path(["objects"])
+            .with_config(force_parallel().with_record_path(["objects"]))
             .map_collect(|rec| record_text(rec).parse().unwrap())
             .unwrap();
         assert_eq!(seq, par);

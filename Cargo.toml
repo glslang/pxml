@@ -2,7 +2,28 @@
 name = "pxml"
 version = "0.1.0"
 edition = "2024"
+# 1.88 is the true floor: the scanner uses let-chains, stabilized in 1.88.
+# Verified in CI by the `msrv` job — do not lower without checking.
+rust-version = "1.88"
 license = "MIT"
+description = "A parallel, StAX-style (pull) XML reader for documents made of many uniform, order-independent records"
+repository = "https://github.com/glslang/pxml"
+documentation = "https://docs.rs/pxml"
+homepage = "https://github.com/glslang/pxml"
+readme = "README.md"
+keywords = ["xml", "parser", "parallel", "streaming", "stax"]
+categories = ["parser-implementations", "concurrency", "encoding"]
+# Internal agent/CI tooling only — DESIGN.md and DECISIONS.md ship, since the
+# API docs and README link to them.
+exclude = [
+    "/.github",
+    "/.claude",
+    "CLAUDE.md",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["zstd"]
