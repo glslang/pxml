@@ -1,6 +1,7 @@
 [package]
 name = "pxml"
 version = "0.1.0"
+authors = ["Gonçalo Carvalho"]
 edition = "2024"
 # 1.88 is the true floor: the scanner uses let-chains, stabilized in 1.88.
 # Verified in CI by the `msrv` job — do not lower without checking.
