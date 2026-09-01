@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(ev) = events.next_event().unwrap() {
             match ev {
                 Event::Start { name, attrs } => {
-                    if name.as_ref() == b"trade" {
+                    if name.as_ref() == "trade" {
                         for attr in attrs.iter() {
                             // key: &[u8], value: Cow<str> (entity-decoded)
                             let attr = attr.unwrap();

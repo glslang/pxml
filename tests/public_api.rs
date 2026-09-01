@@ -174,7 +174,7 @@ fn extract_typed_fields_in_document_order() {
             let mut qty = 0;
             while let Some(ev) = events.next_event().unwrap() {
                 match ev {
-                    Event::Start { name, .. } => in_qty = name.as_ref() == b"qty",
+                    Event::Start { name, .. } => in_qty = name.as_ref() == "qty",
                     Event::Text(t) if in_qty => qty = t.parse().unwrap(),
                     _ => {}
                 }
@@ -223,7 +223,7 @@ fn parse_trade(rec: &pxml::Record) -> Trade {
     while let Some(ev) = events.next_event().unwrap() {
         match ev {
             Event::Start { name, attrs } => {
-                field = name.as_ref().to_vec();
+                field = name.as_ref().as_bytes().to_vec();
                 for attr in attrs.iter() {
                     let attr = attr.unwrap();
                     if attr.key == b"id" {
@@ -475,9 +475,9 @@ fn events_cover_nesting_self_closing_text_and_cdata() {
             while let Some(ev) = events.next_event().unwrap() {
                 out.push(match ev {
                     Event::Start { name, .. } => {
-                        format!("S:{}", String::from_utf8_lossy(name.as_ref()))
+                        format!("S:{}", name.as_ref())
                     }
-                    Event::End { name } => format!("E:{}", String::from_utf8_lossy(name.as_ref())),
+                    Event::End { name } => format!("E:{}", name.as_ref()),
                     Event::Text(t) => format!("T:{t}"),
                     Event::Cdata(c) => format!("C:{}", String::from_utf8_lossy(c)),
                 });
@@ -529,7 +529,7 @@ fn namespace_prefixes_are_lexical_and_resolvable() {
         .map_collect(|rec| {
             let mut events = rec.events();
             match events.next_event().unwrap().unwrap() {
-                Event::Start { name, .. } => String::from_utf8_lossy(name.as_ref()).into_owned(),
+                Event::Start { name, .. } => name.as_ref().to_owned(),
                 other => panic!("expected Start, got {other:?}"),
             }
         })
@@ -573,9 +573,7 @@ fn sequential_reader_sees_the_whole_document() {
     let mut text = String::new();
     while let Some(ev) = reader.next_event().unwrap() {
         match ev {
-            Event::Start { name, .. } => {
-                starts.push(String::from_utf8_lossy(name.as_ref()).into_owned())
-            }
+            Event::Start { name, .. } => starts.push(name.as_ref().to_owned()),
             Event::Text(t) => text.push_str(&t),
             _ => {}
         }

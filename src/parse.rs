@@ -87,10 +87,10 @@ impl<'doc> RecordReader<'doc> {
             let lone_literal =
                 matches!(ev, QxEvent::Text(_)) && !next.as_ref().is_some_and(is_text_run);
             if lone_literal {
-                let QxEvent::Text(e) = &ev else {
+                let QxEvent::Text(e) = ev else {
                     unreachable!("checked Text above")
                 };
-                let text = decode_text(e, self.index)?;
+                let text = text_content(e);
                 self.pending = next;
                 return Ok(Some(Event::Text(text)));
             }
@@ -167,11 +167,11 @@ pub(crate) fn map_event<'e>(
     Ok(match ev {
         QxEvent::Start(e) | QxEvent::Empty(e) => Event::Start {
             name: e.name(),
-            attrs: Attrs::new(e.attributes_raw(), prelude, index),
+            attrs: Attrs::new(e.attributes_raw().as_bytes(), prelude, index),
         },
         QxEvent::End(e) => Event::End { name: e.name() },
         QxEvent::CData(e) => {
-            let bytes: &[u8] = e;
+            let bytes: &[u8] = e.as_bytes();
             Event::Cdata(bytes)
         }
         _ => unreachable!("non-surfaced event passed to map_event"),
@@ -186,12 +186,12 @@ pub(crate) fn is_text_run(ev: &QxEvent) -> bool {
     matches!(ev, QxEvent::Text(_) | QxEvent::GeneralRef(_))
 }
 
-/// Decode a literal `Text` event to UTF-8. Because entity references are now
-/// separate `GeneralRef` events, a `Text` event carries no `&…;` to expand —
-/// decoding suffices, and stays zero-copy (borrowed) for UTF-8 input.
-pub(crate) fn decode_text<'e>(e: &BytesText<'e>, index: usize) -> Result<Cow<'e, str>, XmlError> {
-    e.decode()
-        .map_err(|err| record_error(index, quick_xml::Error::from(err)))
+/// Borrow a literal `Text` event's content. quick-xml decodes to UTF-8 as it
+/// reads, so the event already carries `str`; because entity references are
+/// separate `GeneralRef` events, a `Text` event also carries no `&…;` to expand.
+/// Borrowing is therefore enough, and stays zero-copy.
+pub(crate) fn text_content(e: BytesText<'_>) -> Cow<'_, str> {
+    e.into_inner()
 }
 
 /// Append one text-run event's resolved content to `out`: literal text is
@@ -204,7 +204,7 @@ pub(crate) fn append_run_event(
     index: usize,
 ) -> Result<(), XmlError> {
     match ev {
-        QxEvent::Text(e) => out.push_str(&decode_text(e, index)?),
+        QxEvent::Text(e) => out.push_str(e),
         QxEvent::GeneralRef(e) => {
             if let Some(ch) = e
                 .resolve_char_ref()
@@ -212,17 +212,15 @@ pub(crate) fn append_run_event(
             {
                 out.push(ch);
             } else {
-                let name = e
-                    .decode()
-                    .map_err(|err| record_error(index, quick_xml::Error::from(err)))?;
-                match prelude.resolve_entity(&name) {
+                let name: &str = e;
+                match prelude.resolve_entity(name) {
                     Some(value) => out.push_str(value),
                     None => {
                         return Err(record_error(
                             index,
                             quick_xml::Error::from(EscapeError::UnrecognizedEntity(
                                 0..name.len(),
-                                name.into_owned(),
+                                name.to_owned(),
                             )),
                         ));
                     }
@@ -272,10 +270,10 @@ mod tests {
         while let Some(ev) = r.next_event().expect("event ok") {
             out.push(match ev {
                 Event::Start { name, .. } => {
-                    format!("S:{}", std::str::from_utf8(name.as_ref()).unwrap())
+                    format!("S:{}", name.as_ref())
                 }
                 Event::End { name } => {
-                    format!("E:{}", std::str::from_utf8(name.as_ref()).unwrap())
+                    format!("E:{}", name.as_ref())
                 }
                 Event::Text(t) => format!("T:{t}"),
                 Event::Cdata(c) => format!("C:{}", std::str::from_utf8(c).unwrap()),
@@ -428,7 +426,7 @@ mod tests {
         let Event::Start { name, attrs } = ev else {
             panic!("expected start");
         };
-        assert_eq!(name.as_ref(), b"a");
+        assert_eq!(name.as_ref(), "a");
         let got: Vec<(String, String)> = attrs
             .iter()
             .map(|a| {

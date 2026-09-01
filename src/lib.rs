@@ -103,7 +103,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event as QxEvent;
 use rayon::prelude::*;
 
-use crate::parse::{append_run_event, decode_text, is_text_run, map_event};
+use crate::parse::{append_run_event, is_text_run, map_event, text_content};
 use crate::scan::parse_doctype_entities;
 
 /// Owns the document buffer (heap `Vec` or `mmap`) plus a [`Config`], and is the
@@ -483,7 +483,7 @@ impl ParallelXml {
     /// let mut names = Vec::new();
     /// while let Some(ev) = reader.next_event()? {
     ///     if let Event::Start { name, .. } = ev {
-    ///         names.push(String::from_utf8(name.as_ref().to_vec()).unwrap());
+    ///         names.push(name.as_ref().to_owned());
     ///     }
     /// }
     ///
@@ -612,10 +612,10 @@ impl<'doc> SeqReader<'doc> {
             let lone_literal =
                 matches!(ev, QxEvent::Text(_)) && !next.as_ref().is_some_and(is_text_run);
             if lone_literal {
-                let QxEvent::Text(e) = &ev else {
+                let QxEvent::Text(e) = ev else {
                     unreachable!("checked Text above")
                 };
-                let text = decode_text(e, 0)?;
+                let text = text_content(e);
                 self.pending = next;
                 return Ok(Some(Event::Text(text)));
             }
@@ -653,7 +653,7 @@ impl<'doc> SeqReader<'doc> {
             match self.read_raw()? {
                 None => return Ok(None),
                 Some(QxEvent::DocType(e)) => {
-                    parse_doctype_entities(&e, &mut self.prelude.entities);
+                    parse_doctype_entities(e.as_bytes(), &mut self.prelude.entities);
                 }
                 Some(QxEvent::Comment(_) | QxEvent::PI(_) | QxEvent::Decl(_)) => continue,
                 Some(keep) => return Ok(Some(keep)),
@@ -890,10 +890,10 @@ mod tests {
         while let Some(ev) = sr.next_event().unwrap() {
             tags.push(match ev {
                 Event::Start { name, .. } => {
-                    format!("S:{}", std::str::from_utf8(name.as_ref()).unwrap())
+                    format!("S:{}", name.as_ref())
                 }
                 Event::End { name } => {
-                    format!("E:{}", std::str::from_utf8(name.as_ref()).unwrap())
+                    format!("E:{}", name.as_ref())
                 }
                 Event::Text(t) => format!("T:{t}"),
                 Event::Cdata(c) => format!("C:{}", std::str::from_utf8(c).unwrap()),
