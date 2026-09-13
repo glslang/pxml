@@ -53,7 +53,7 @@ Phase B (parallel, rayon): record 0 ─▶ worker        record 1 ─▶ worker 
 
 ```toml
 [dependencies]
-pxml = "0.1"
+pxml = "0.2"
 ```
 
 Requires **Rust 1.88+** (edition 2024, plus let-chains used by the scanner).

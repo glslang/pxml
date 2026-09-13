@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-13
+
+### Changed
+
+- Upgrade `quick-xml` from 0.41 to 0.42 and adapt parsing to its UTF-8 text events.
+- **Breaking:** the `QName` exposed by `Event::Start` and `Event::End` now
+  returns `&str` from `as_ref()` instead of `&[u8]`. Compare names with string
+  literals (for example, `name.as_ref() == "trade"` instead of
+  `name.as_ref() == b"trade"`). Use `name.as_ref().as_bytes()` when bytes are
+  needed. Attribute keys remain `&[u8]`.
+
+### Maintenance
+
+- Add automatic merging for eligible Dependabot updates after CI passes.
+
 ## [0.1.0] — 2026-07-21
 
 Initial release.
@@ -52,5 +67,6 @@ scanner does not compile on 1.85–1.87. CI now verifies the declared MSRV.
   position. External DTDs and parameter entities are rejected with
   `XmlError::UnsupportedDtd`; non-UTF-8 input with `XmlError::Encoding`.
 
-[Unreleased]: https://github.com/glslang/pxml/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/glslang/pxml/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/glslang/pxml/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/glslang/pxml/releases/tag/v0.1.0
