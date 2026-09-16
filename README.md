@@ -118,6 +118,12 @@ assert_eq!(idx.records()[0], 4..12); // byte range of `<r>a</r>`
 # Ok::<(), pxml::XmlError>(())
 ```
 
+The scan is memoized per document: `index()` and the drivers share one
+`ChunkIndex`, so indexing and then parsing scans the buffer once, not twice.
+`index()` therefore hands back a borrow — `clone()` it to keep it past the
+document — and `with_config` drops the memo, since a new record path frames
+different records.
+
 ### Records under a nested container
 
 By default the records are the root's direct children. When they instead live
@@ -143,9 +149,10 @@ The path may descend several levels (`.with_record_path(["body", "objects"])`),
 and the children of *every* matching container are framed. An empty path (the
 default) means the root itself.
 
-The streaming reader takes no `Config` — the parallelism thresholds only apply
-to the resident path — so it sets the path directly:
-`StreamReader::from_reader(r).record_path(["objects"])`.
+The streaming reader ignores the parallelism thresholds (it always runs the
+pipeline) but takes the same `Config`, so the path can be set either way:
+`StreamReader::from_reader(r).record_path(["objects"])`, or
+`.with_config(Config::new().with_record_path(["objects"]))`.
 
 The container's namespace declarations are merged into the one shared `Prelude`
 context (see [Limitations](#limitations) for the multi-container caveat).
@@ -182,10 +189,10 @@ C-backed `zstd` dependency.
 mmap, but a problem for a multi-GB *compressed* file (you can't mmap the
 decompressed form), or for many large files at once. `StreamReader` runs the
 pipeline without holding the whole document: a single producer thread
-decompresses and frames records incrementally, and a `rayon` pool parses them in
-parallel, with a bounded channel providing backpressure. Resident memory is
-bounded by the in-flight records (≈ `threads × record size`) plus one chunk —
-**independent of document size**.
+decompresses and frames records incrementally, and a fixed set of worker threads
+parses them in parallel, with a bounded channel providing backpressure. Resident
+memory is bounded by the in-flight batches (≈ `queue capacity × batch size`) plus
+one chunk — **independent of document size**.
 
 ```rust,no_run
 # // Gated so this block still compiles with --no-default-features.
@@ -208,7 +215,8 @@ StreamReader::from_zstd_reader(File::open("trades.xml.zst")?)?
 
 `from_reader(impl Read)` streams an already-decompressed source. Records are
 framed and parsed in batches (one arena allocation each), which keeps the
-producer→worker handoff cheap. The trade-offs vs. the resident path: output is
+producer→worker handoff cheap; batch size, queue depth and worker count are
+`Config` knobs (see [Configuration](#configuration--the-small-input-fallback)). The trade-offs vs. the resident path: output is
 **unordered** and records are **owned** (copied out of the decode buffer rather
 than borrowed). In exchange you get constant memory — and, for large documents,
 often *better* throughput, because the pipeline overlaps decompression with
@@ -221,7 +229,7 @@ document. On a 2M-record / 184 MiB-decompressed file the streaming path measured
 | Type | Purpose |
 |------|---------|
 | `ParallelXml` | Owns the buffer (`Vec` or `mmap`) + `Config`; entry point. |
-| `Config` | Tuning: `parallel_threshold`, `min_records`, `record_path`. |
+| `Config` | Tuning: `parallel_threshold`, `min_records`, `record_path`, and the `stream_*` pipeline knobs. |
 | `ChunkIndex` | Phase A output: per-record byte ranges + shared `Prelude`. |
 | `Prelude` | Immutable shared context: encoding, root name, namespaces, entities. |
 | `StreamReader` | Bounded-memory streaming pipeline over a `Read` / zstd source. |
@@ -260,7 +268,32 @@ let doc = ParallelXml::from_bytes(bytes).with_config(config);
 Its fields are private, so a future release can add a knob without breaking
 callers. Read them back with the matching getters (`config.min_records()`).
 
-Defaults: `parallel_threshold = 4 MiB`, `min_records = 64`.
+The same `Config` sizes the streaming pipeline — pass it to
+`StreamReader::with_config`:
+
+```rust
+use pxml::{Config, StreamReader};
+
+# let xml = &b"<rs><r>a</r></rs>"[..];
+let config = Config::new()
+    .with_stream_batch_records(256)      // records per pipeline message
+    .with_stream_batch_bytes(1 << 20)    // …or bytes, whichever comes first
+    .with_stream_queue_capacity(0)       // 0 = 2 × the rayon pool's threads
+    .with_stream_workers(0);             // 0 = the rayon pool's thread count
+
+StreamReader::from_reader(xml).with_config(config).par_for_each(|_rec| {})?;
+# Ok::<(), pxml::XmlError>(())
+```
+
+| Knob | Default | Applies to |
+|---|---|---|
+| `parallel_threshold` | 4 MiB | resident |
+| `min_records` | 64 | resident |
+| `record_path` | empty (root) | both |
+| `stream_batch_records` | 256 | streaming |
+| `stream_batch_bytes` | 1 MiB | streaming |
+| `stream_queue_capacity` | 0 (= `2 ×` pool threads) | streaming |
+| `stream_workers` | 0 (= pool threads) | streaming |
 
 ## Performance
 
@@ -270,7 +303,21 @@ are **~3–6×** wall-clock on large files (hundreds of MB) with substantial
 per-record work, with diminishing returns past ~8 cores. Light records
 (small fields) bottleneck on bandwidth sooner and scale less.
 
-Run the included benchmark (release is essential):
+The repeatable measurement is the `divan` suite in `benches/throughput.rs`. It
+sweeps four document shapes (tiny records, large records, attribute-heavy,
+entity-heavy) across Phase A alone, the resident drivers, the sequential
+baseline, the streaming pipeline, compressed input, a thread sweep, and the
+streaming sizing knobs — all reported as bytes/s over the uncompressed document:
+
+```sh
+cargo bench                          # everything
+cargo bench -- streaming             # one module
+cargo bench -- resident::map_collect # one benchmark
+cargo bench --features memchr-framer -- streaming   # compare framers
+```
+
+`examples/bench.rs` remains the exploratory driver — it also generates test
+corpora and runs real files (release is essential):
 
 ```sh
 cargo run --release --example bench                 # 200k records, auto thread sweep
@@ -285,7 +332,8 @@ counts (throughput + speedup) plus a small-input fallback demonstration. The
 `file` mode compares the resident `from_path` path against the streaming
 `from_zstd_reader` path on a real file. See [`DECISIONS.md`](DECISIONS.md) §15 for
 measured numbers and analysis (notably: with batching, streaming is both
-bounded-memory *and* ~2.2× faster than resident on a large file).
+bounded-memory *and* ~2.2× faster than resident on a large file), and §19 for the
+per-shape reference numbers from the `divan` suite.
 
 ## What's handled
 

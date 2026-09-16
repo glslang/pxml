@@ -120,16 +120,13 @@ fn with_config_replaces_rather_than_merges() {
     // (<manifest> and <objects>), rather than retaining the earlier path.
     let replaced = ParallelXml::from_bytes(&xml[..])
         .with_config(Config::new().with_record_path(["objects"]))
-        .with_config(Config::new())
-        .index()
-        .unwrap();
-    assert_eq!(replaced.len(), 2);
+        .with_config(Config::new());
+    assert_eq!(replaced.index().unwrap().len(), 2);
 
     let kept = ParallelXml::from_bytes(&xml[..])
         .with_config(Config::new())
-        .with_config(Config::new().with_record_path(["objects"]))
-        .index()
-        .unwrap();
+        .with_config(Config::new().with_record_path(["objects"]));
+    let kept = kept.index().unwrap();
     assert_eq!(kept.len(), 1);
 }
 
@@ -455,10 +452,8 @@ fn record_lookalikes_in_markup_do_not_misframe() {
         <r>also real</r>
     </rs>"#;
 
-    let idx = ParallelXml::from_bytes(xml.as_bytes().to_vec())
-        .index()
-        .unwrap();
-    assert_eq!(idx.len(), 2);
+    let doc = ParallelXml::from_bytes(xml.as_bytes().to_vec());
+    assert_eq!(doc.index().unwrap().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +553,48 @@ fn index_exposes_ranges_that_slice_the_source() {
     assert_eq!(&xml[ranges[1].clone()], b"<r>b</r>");
 }
 
+/// The Phase A scan is memoized: repeated `index()` calls hand back the very
+/// same `ChunkIndex` rather than rescanning the buffer.
+#[test]
+fn index_is_memoized_across_calls() {
+    let doc = ParallelXml::from_bytes(trades_doc(64).into_bytes());
+
+    let first = doc.index().unwrap() as *const _;
+    let second = doc.index().unwrap() as *const _;
+    assert_eq!(first, second);
+
+    // The drivers share the same memo, and it survives them.
+    doc.par_for_each(|_| {}).unwrap();
+    assert_eq!(doc.index().unwrap() as *const _, first);
+}
+
+/// `with_config` can change the framing, so it must drop the memoized scan.
+#[test]
+fn with_config_invalidates_the_memoized_index() {
+    let xml = b"<root><manifest/><objects><object/><object/><object/></objects></root>";
+
+    let doc = ParallelXml::from_bytes(&xml[..]);
+    assert_eq!(doc.index().unwrap().len(), 2); // <manifest> + <objects>
+
+    let doc = doc.with_config(Config::new().with_record_path(["objects"]));
+    assert_eq!(doc.index().unwrap().len(), 3); // the three <object>s
+}
+
+/// A `ChunkIndex` can be cloned out of the document, and `prelude_arc` shares
+/// the same context rather than copying it.
+#[test]
+fn index_clone_and_prelude_arc_share_the_prelude() {
+    let doc = ParallelXml::from_bytes(b"<rs><r>a</r><r>b</r></rs>".to_vec());
+    let owned = doc.index().unwrap().clone();
+
+    assert_eq!(owned.records(), doc.index().unwrap().records());
+    assert_eq!(owned.prelude().root_name.as_ref(), "rs");
+    assert!(std::sync::Arc::ptr_eq(
+        &owned.prelude_arc(),
+        &doc.index().unwrap().prelude_arc()
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // The sequential escape hatch
 // ---------------------------------------------------------------------------
@@ -583,21 +620,43 @@ fn sequential_reader_sees_the_whole_document() {
     assert_eq!(text, "ab");
 }
 
+/// The streaming pipeline's sizing knobs are reachable from the public `Config`
+/// and do not change what is parsed.
+#[test]
+fn stream_config_knobs_are_public_and_result_preserving() {
+    let xml = trades_doc(500);
+    let config = Config::new()
+        .with_stream_batch_records(4)
+        .with_stream_batch_bytes(256)
+        .with_stream_queue_capacity(2);
+
+    let reader = StreamReader::from_reader(xml.as_bytes()).with_config(config);
+    assert_eq!(reader.config().stream_batch_records(), 4);
+
+    let seen = AtomicUsize::new(0);
+    reader
+        .par_for_each(|_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+    assert_eq!(seen.load(Ordering::Relaxed), 500);
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 #[test]
 fn malformed_document_is_rejected_with_an_offset() {
-    let res = ParallelXml::from_bytes(&b"<rs><r></rs>"[..]).index();
-    assert!(matches!(res, Err(XmlError::Malformed(_))));
+    let doc = ParallelXml::from_bytes(&b"<rs><r></rs>"[..]);
+    assert!(matches!(doc.index(), Err(XmlError::Malformed(_))));
 }
 
 #[test]
 fn external_dtd_is_rejected_rather_than_ignored() {
     let xml = br#"<!DOCTYPE rs SYSTEM "ext.dtd"><rs><r>a</r></rs>"#;
-    let res = ParallelXml::from_bytes(&xml[..]).index();
-    assert!(matches!(res, Err(XmlError::UnsupportedDtd)));
+    let doc = ParallelXml::from_bytes(&xml[..]);
+    assert!(matches!(doc.index(), Err(XmlError::UnsupportedDtd)));
 }
 
 #[test]

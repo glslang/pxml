@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A repeatable benchmark suite** (`cargo bench`, `benches/throughput.rs`, built
+  on `divan`). Four document shapes (many tiny records, large records,
+  attribute-heavy, entity-heavy) across Phase A alone, the resident drivers, the
+  sequential baseline, the streaming pipeline, compressed input, a thread sweep,
+  and the streaming sizing knobs — all reported as bytes/s over the uncompressed
+  document. `examples/bench.rs` stays as the exploratory driver (corpus
+  generation, real files). Per-shape reference numbers are in `DECISIONS.md` §19.
+- **Streaming pipeline sizing knobs** on `Config`, plus
+  `StreamReader::with_config` / `StreamReader::config` to use them:
+  `with_stream_batch_records` (default 256), `with_stream_batch_bytes`
+  (default 1 MiB — a batch now closes on whichever cap comes first, so large
+  records cannot turn the record cap into a large allocation),
+  `with_stream_queue_capacity` and `with_stream_workers` (both default to
+  deriving from `rayon`'s current pool). `with_stream_workers` gives streaming an
+  explicit worker count rather than only inheriting the ambient pool.
+- **`ChunkIndex::prelude_arc`** — a cheap `Arc<Prelude>` clone for keeping the
+  shared prolog context after the index is gone. `ChunkIndex` is now `Clone`.
+
+### Changed
+
+- **The Phase A scan is memoized per document.** `index()` and the
+  `par_for_each` / `map_collect` / `try_*` drivers share one `ChunkIndex`, so
+  indexing and then parsing no longer scans the buffer twice. `with_config`
+  drops the memo (a new record path frames different records). Measured 1.16×
+  (tiny records) to 1.98× (attribute-heavy) faster on an already-indexed
+  document.
+- **Breaking:** `ParallelXml::index` returns `Result<&ChunkIndex, XmlError>`
+  instead of `Result<ChunkIndex, XmlError>`, so reuse costs nothing. Bind the
+  document to a variable before calling it
+  (`let doc = ParallelXml::from_bytes(…); let idx = doc.index()?;`) and `clone()`
+  the index if it must outlive the document.
+- **Breaking:** `ChunkIndex::prelude` returns `&Prelude` instead of
+  `&Arc<Prelude>`; use `prelude_arc()` when you want the `Arc`.
+- **The streaming consumer no longer goes through `rayon`'s `par_bridge`.** A
+  fixed set of worker threads pulls batches off the channel directly (one lock
+  per batch, never held while parsing): ~2× faster on entity-heavy records, within
+  noise elsewhere, and a closure that itself uses `rayon` can no longer contend
+  with the pipeline for pool threads. The default worker count still comes from
+  `rayon::current_num_threads()`, so `pool.install(…)` sizes the pipeline as
+  before. See `DECISIONS.md` §22.
+
 ## [0.2.0] — 2026-09-13
 
 ### Changed

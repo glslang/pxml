@@ -322,6 +322,11 @@ remaining serial-fraction ceiling.
 
 ## 15. Benchmark methodology and findings
 
+> **Superseded as the primary harness by (19).** The `divan` suite in
+> `benches/throughput.rs` is now the repeatable measurement; `examples/bench.rs`
+> remains the exploratory driver (corpus generation, real `.zst` files). The
+> findings below still hold and are the source of the streaming design.
+
 **Methodology.** `examples/bench.rs` generates a synthetic `<trades>` document of
 N uniform records (each with attributes, fields, and an `&amp;` entity so decoding
 is exercised) and a per-record workload that drives the full `events()` API and
@@ -386,6 +391,27 @@ bottleneck. It can still help documents with large text/CDATA spans (big bulk
 skips), so it's kept available rather than dropped. Both framers share the struct,
 prelude parse, compaction and emit; only the state enum and the content loop
 differ under `cfg`, and both pass the same chunk-size parity tests (1…1000).
+
+**Re-measured with the suite in (19) — the picture has changed.** On the four
+benchmark shapes, streaming `par_for_each` medians, the `memchr` framer is now
+**~1.75× faster on attribute-heavy records** (19 ms vs 33 ms — long start tags are
+exactly what bulk scanning is for), and within noise on the other three
+(`small` ~35 ms vs ~36–47 ms, if anything *less* variable; `large` and
+`entity_heavy` tied). Nothing about the framer changed; the comparison did — the
+old number came from one tiny-record document on different hardware, and the
+batching/consumer work since (14, 22) moved the producer off the critical path.
+On this evidence the feature looks like it should become default-on, but the
+call belongs on hardware the maintainer trusts: this box's spread is wide enough
+that "tied" on the headline small-record shape is not the same as "no
+regression". Reproduce with
+`cargo bench --features memchr-framer -- streaming` against `cargo bench -- streaming`.
+
+**No fast path is left to add.** With the feature on, every *scanning* state is
+bulk: `memchr` for text→`<` and for a quoted attribute value, `memchr3` for the
+tag interior, `memmem` for the `-->` / `]]>` / `?>` terminators. What remains
+byte-by-byte (`Lt`, `Bang`, `BangDash`, `CDATA[` matching) is O(1)-per-tag
+dispatch over one to six bytes, where a bulk search could only lose. The
+remaining producer-side work is the prelude parse, not the content loop.
 
 **Bug worth noting.** The first cut had `memmem::find`'s arguments swapped
 (`find(haystack, needle)`), so terminators were searched for *inside* the 3-byte
@@ -494,12 +520,162 @@ documents with leading/trailing siblings.
 
 ---
 
+## 19. A repeatable benchmark suite (`benches/throughput.rs`, divan)
+
+**Context.** Performance work so far leaned on `examples/bench.rs`: one synthetic
+document shape, manual `Instant` timing, and setup/timing boundaries that differ
+between the baseline and parallel cases (15). That is enough to spot a 2× shift
+and not enough to *tune* — it cannot say whether a knob helped by 5%, and it
+covers neither attribute-heavy nor entity-heavy records, the two shapes where
+Phase B's cost is not proportional to bytes.
+
+**Decision.** Add a `divan` benchmark suite (`cargo bench`, `benches/throughput.rs`)
+as the canonical performance harness, and keep `examples/bench.rs` as the
+exploratory driver (it also generates `.zst` corpora and runs real files, which a
+benchmark harness should not). Every benchmark reports bytes/s over the
+*uncompressed* document, so numbers compare across shapes, paths and thread
+counts. The axes are: four document shapes (`small` 200k tiny records, `large` 4k
+× ~2 KiB, `attr_heavy` 40k × 12 attributes, `entity_heavy` 40k entity-dense
+records); execution path (Phase A alone, resident ordered/unordered, `SeqReader`
+baseline, streaming, compressed resident vs compressed streaming); a thread sweep
+on an explicit `rayon` pool; and the streaming sizing knobs (20).
+
+**Why divan over Criterion.** One dev-dependency with a small tree, built-in
+`counter` support for bytes/s, and argument sweeps (`args = […]`) that express
+the "same benchmark across shapes/threads/knobs" structure directly. Criterion's
+extra statistics don't pay for the dependency weight here; its MSRV would also
+outrank the crate's.
+
+**Consequences.** Corpora are generated once per process and leaked, so a
+`ParallelXml` can borrow them for `'static` and setup never lands in a timed
+region. Benchmarks that must defeat the memoized scan (20) build a fresh
+`ParallelXml` per iteration via `with_inputs`, which is free (the buffer is
+borrowed). Reference numbers on a 4-core cloud VM (medians; this machine is
+noisy, so treat ratios, not absolutes, as the signal):
+
+| Benchmark | small | large | attr_heavy | entity_heavy |
+|---|---|---|---|---|
+| `phase_a::scan` | 329 MB/s | 10.6 GB/s | 635 MB/s | 1.14 GB/s |
+| `resident::map_collect` | 122 MB/s | 4.45 GB/s | 308 MB/s | 65.5 MB/s |
+| `resident::map_collect` (memoized index) | 142 MB/s | 7.56 GB/s | 612 MB/s | 67.1 MB/s |
+| `compressed::resident` | 101 MB/s | 2.41 GB/s | 204 MB/s | 62.3 MB/s |
+| `compressed::streaming` | 142 MB/s | 1.98 GB/s | 174 MB/s | 176 MB/s |
+
+Thread sweep (`resident::map_collect_threads`, `small`): 55.6 / 82.7 / 122 / 122 /
+120 MB/s at 1 / 2 / 4 / 8 / 16 threads — **~2.2× at 4 threads on 4 cores**, flat
+after, consistent with (15) and with Phase A's share of the work (`scan` is only
+2.7× the full parallel parse on this shape).
+
+---
+
+## 20. The Phase A scan is memoized per document
+
+**Context.** `index()`, `par_for_each`, `map_collect` and the `try_*` drivers each
+called `scan_with` directly, so a program that counted records and then parsed
+them scanned the buffer twice — paying the *serial* fraction twice, the one cost
+the whole architecture is organized around.
+
+**Decision.** `ParallelXml` memoizes its `ChunkIndex` in a `OnceLock`, filled on
+first use and shared by every driver. `with_config` drops the memo, since a new
+`record_path` frames different records. `index()` now returns `&ChunkIndex`
+(**breaking**; clone it to outlive the document) so reuse is genuinely free rather
+than a `Vec<Range>` copy per call.
+
+**Why a `OnceLock` and not a `Mutex`/`RwLock`.** The drivers take `&self` and run
+on a thread pool; `OnceLock` gives interior mutability with no lock on the read
+path. Two threads racing the first call both scan and one result is dropped — the
+scan is pure, so either is correct, and the race window is one scan.
+
+**Errors are not memoized.** `XmlError` is not `Clone` (it carries a boxed source),
+and a failing scan is fail-fast — it stops at the first malformed byte instead of
+walking the document. A failed `index()` therefore re-scans on the next call.
+
+**Consequences.** `map_collect` on an already-indexed document measures 1.16×
+(small) to 1.98× (attribute-heavy) faster than the cold call (19) — the memo is
+worth the most exactly where Phase A's share is largest. `ChunkIndex` is now
+`Clone`, and gained `prelude_arc()` (a cheap `Arc` clone for keeping the shared
+context after the index is gone) while `prelude()` returns `&Prelude` rather than
+`&Arc<Prelude>`.
+
+---
+
+## 21. Streaming pipeline sizing is configurable (and byte-bounded)
+
+**Context.** `StreamReader` hard-coded `BATCH = 256` records per message and a
+channel capacity of `2 × threads`, and took no `Config` at all. Two problems: the
+sizing is workload-dependent (19 shows batch size moving throughput by 100×), and
+a record cap alone does not bound memory — 256 × 1 MiB records is a 256 MiB batch
+in a pipeline whose entire selling point is bounded memory.
+
+**Decision.** Move the sizing into `Config` — `with_stream_batch_records`
+(default 256), `with_stream_batch_bytes` (default 1 MiB), `with_stream_queue_capacity`
+and `with_stream_workers` (both default `0` = derive from `rayon`'s current pool)
+— and give `StreamReader` a `with_config`. A batch closes when *either* cap is
+reached; the byte check runs after a push, so a single record larger than the cap
+is dispatched alone rather than stalling the producer. `0` for either cap means
+one record per batch (a cap of `0` would otherwise be unsatisfiable).
+
+**Why these defaults.** The measured knee is broad: on the large-record shape,
+batch-byte caps of 64 KiB, 1 MiB and 8 MiB are within noise of each other
+(~1.6–1.9 GB/s) while 4 KiB collapses to 264 MB/s; on tiny records, batch-record
+caps of 256 and 1024 are within ~10% while 16 costs 8× and 1 costs **100×**
+(3.7 s vs 37 ms — a channel round-trip per record). So 256 records / 1 MiB sits
+safely on the plateau for both, and the byte cap only binds for records large
+enough that per-record cost dominates the handoff anyway.
+
+**Consequences.** `StreamReader` now carries a `Config` instead of a bare
+`record_path`, and `record_path()` is the shorthand for setting just that field.
+`with_stream_workers` also answers "no way to use a specific `ThreadPool`" (issue
+#5): the worker count is explicit, and `pool.install(…)` still sets it by default.
+
+---
+
+## 22. A fixed-worker consumer replaces `par_bridge`
+
+**Context.** The streaming consumer was `rx.into_iter().par_bridge().for_each(…)`.
+`par_bridge` bridges a sequential iterator into `rayon` by having pool threads
+pull items under a shared mutex — and with a *blocking* iterator (a channel
+`recv`), the puller blocks while holding it. The calling thread also participates,
+so the pipeline runs `producer + pool threads + caller` on the machine.
+
+**Decision.** Run a fixed set of worker threads that pull batches off the channel
+themselves: a `Mutex<Receiver<Batch>>` locked only across `recv` (never while
+parsing), `workers` threads in a `thread::scope`. Worker count still comes from
+`rayon::current_num_threads()` by default, so `pool.install(…)` sizes the pipeline
+as before, and `Config::with_stream_workers` sets it directly (21).
+
+**Why.** Measured with the new suite (19), A/B over three runs each on a 4-core
+VM, streaming `par_for_each` medians:
+
+| Shape | `par_bridge` | fixed workers |
+|---|---|---|
+| entity_heavy | ~34–36 ms | **~17 ms** |
+| small | ~38–50 ms | ~40–47 ms |
+| attr_heavy | ~32 ms | ~34 ms |
+| large | ~4.4–5.4 ms | ~4.5–5.1 ms |
+
+A ~2× win on the parse-heavy shape (where per-record work is largest and
+oversubscription hurts most), and a 0–10% loss elsewhere that sits inside this
+box's run-to-run spread. The design is also simpler to reason about — N workers,
+one batch each, one lock per *batch* — and it removes a deadlock hazard: the
+workers are plain threads, so a closure that itself uses `rayon` is not competing
+for the pool threads that the pipeline is blocking.
+
+**Consequences.** Lock poisoning is handled explicitly: a poisoned lock means
+another worker panicked, so the remaining workers stop, which drops the receiver,
+releases the producer, and lets the original panic propagate out of the scope
+(the same observable behaviour as `par_bridge` unwinding). `rayon` is still used
+for the resident path and for the default worker count.
+
+---
+
 ## Future work
 
-- **Reduce streaming overhead further.** Batching + arena are done (15); a
-  `memchr` framer is available behind `memchr-framer` but marginal on small
-  records (16). A tunable batch size `B` and a faster prelude parse are the
-  remaining producer-side knobs.
+- **Reduce streaming overhead further.** Batching + arena are done (15), the
+  batch/queue/worker sizing is now tunable (21), and the consumer no longer goes
+  through `par_bridge` (22). A faster prelude parse is the remaining
+  producer-side knob — and deciding, on trusted hardware, whether the `memchr`
+  framer should become default-on (16).
 - **Parallel decompression / parallel Phase A.** The single sequential producer is
   now the ceiling. zstd multi-frame decode or a speculative chunk-and-verify scan
   would attack the remaining serial fraction.
