@@ -5,9 +5,11 @@
 //! a single producer thread and parses the framed records on a fixed set of
 //! worker threads. A bounded channel between them provides backpressure, so the
 //! producer only runs ahead as far as the workers can drain: resident memory is
-//! bounded by the in-flight batches (≈ `queue capacity × batch size`) plus one
-//! chunk, independent of document size. Batch size and queue capacity are
-//! [`Config`] knobs; see [`Config::with_stream_batch_records`].
+//! bounded by the live batches — `queue capacity + workers + 1` of them, since a
+//! worker holds the batch it is parsing and the producer is filling the next —
+//! plus the chunk being framed, independent of document size. Batch size, queue
+//! capacity and worker count are [`Config`] knobs; see
+//! [`Config::with_stream_batch_records`].
 //!
 //! Trade-offs vs. the resident [`ParallelXml`](crate::ParallelXml) path: records
 //! are *owned* (copied out of the decompression buffer rather than borrowed), and
@@ -45,8 +47,8 @@ struct Batch {
 /// Use this instead of [`ParallelXml`](crate::ParallelXml) when the document
 /// does not comfortably fit in memory — typically a multi-GB *compressed* file,
 /// which cannot be mmap'd in its decompressed form. Resident memory is bounded
-/// by the in-flight records (≈ `threads × record size`) plus one chunk,
-/// independent of document size.
+/// by `(queue capacity + workers + 1) × batch size` plus the chunk being framed
+/// (see [`Config::with_stream_queue_capacity`]), independent of document size.
 ///
 /// ```
 /// use pxml::{Event, StreamReader};

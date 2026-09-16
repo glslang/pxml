@@ -191,8 +191,9 @@ decompressed form), or for many large files at once. `StreamReader` runs the
 pipeline without holding the whole document: a single producer thread
 decompresses and frames records incrementally, and a fixed set of worker threads
 parses them in parallel, with a bounded channel providing backpressure. Resident
-memory is bounded by the in-flight batches (≈ `queue capacity × batch size`) plus
-one chunk — **independent of document size**.
+memory is bounded by the live batches — `(queue capacity + workers + 1) × batch
+size`, since a worker holds the batch it is parsing and the producer is filling
+the next — plus the chunk being framed, **independent of document size**.
 
 ```rust,no_run
 # // Gated so this block still compiles with --no-default-features.

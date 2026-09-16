@@ -302,10 +302,14 @@ parity with the materialized scanner across chunk sizes 1…1000.
 prelude (shared, small)
 + producer carry buffer        (one in-progress record + one decompress chunk)
 + batch being built            (≤ B records)
-+ queue_depth batches in flight (capacity × B records; capacity ≈ 2×threads)
++ queue_depth batches queued   (capacity × B records; capacity ≈ 2×workers)
++ one batch per worker         (workers × B records, held while parsing)
 + results retained             (none for par_for_each)
 ```
-≈ **O(threads × B × record_size)**, still independent of document size (`B`
+≈ **O(workers × B × record_size)** — note the live-batch count is
+`capacity + workers + 1`, not `capacity`: a shallow queue alone does not cap
+memory, because each worker removes a batch to parse it and the producer is
+filling the next. Still independent of document size (`B`
 trades a little memory + first-batch latency for throughput). The per-record floor
 is **O(max_record_size)**: a record can't be split across workers, so the producer
 must buffer a whole record before emitting it. Fine for many small uniform
