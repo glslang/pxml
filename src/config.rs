@@ -156,9 +156,21 @@ impl Config {
     }
 
     /// Set the capacity of the [`StreamReader`](crate::StreamReader) channel —
-    /// how many framed batches may be in flight before the producer blocks. This
-    /// is the pipeline's backpressure knob, so it also bounds resident memory:
-    /// roughly `capacity × batch size` on top of the chunk being framed.
+    /// how many framed batches may sit *queued* before the producer blocks. This
+    /// is the pipeline's backpressure knob, so it also bounds resident memory,
+    /// but the queue is not the only place a batch lives: each worker removes a
+    /// batch to parse it, and the producer is always filling one more. The
+    /// resident bound is therefore
+    ///
+    /// ```text
+    /// (queue capacity + workers + 1) × batch size   +   the chunk being framed
+    /// ```
+    ///
+    /// so a shallow queue does not by itself cap memory — with 64 workers, a
+    /// capacity of 1 still allows ~66 live batches. Size
+    /// [the batch](Self::with_stream_batch_bytes) and
+    /// [the workers](Self::with_stream_workers) together with this knob when
+    /// tuning against a memory ceiling.
     ///
     /// Defaults to `0`, meaning "derive from the pool": twice rayon's current
     /// thread count.
