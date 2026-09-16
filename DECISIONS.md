@@ -665,11 +665,22 @@ one batch each, one lock per *batch* — and it removes a deadlock hazard: the
 workers are plain threads, so a closure that itself uses `rayon` is not competing
 for the pool threads that the pipeline is blocking.
 
-**Consequences.** Lock poisoning is handled explicitly: a poisoned lock means
-another worker panicked, so the remaining workers stop, which drops the receiver,
-releases the producer, and lets the original panic propagate out of the scope
-(the same observable behaviour as `par_bridge` unwinding). `rayon` is still used
-for the resident path and for the default worker count.
+**Consequences.** Cancellation had to be built, not inherited. `par_bridge` stops
+scheduling when the iteration unwinds; a hand-rolled pool does not. Because `f`
+runs *outside* the receiver lock, a panic in it cannot poison the mutex, so the
+surviving workers would keep pulling and the panic would not surface until the
+whole document had been parsed — on an endless source, not at all. A shared
+`stop` flag, set by a drop guard as the panicking worker unwinds, makes the
+siblings leave the loop after at most the batch already in hand; the scope then
+joins them and resumes the panic, and unwinding drops the receiver, which
+releases a producer blocked on `send`. What that cannot shorten is a producer
+blocked inside `Read::read` on a source that yields nothing further: the scope
+must join that thread, so the panic surfaces when the read returns. Documented on
+`par_for_each`, and regression-tested by asserting how *few* records are parsed
+after a panic (the test also silences the panic hook — under `RUST_BACKTRACE=1`
+symbolization runs before unwinding starts, long enough to drain a small document
+and turn the assertion into a timing race). `rayon` is still used for the
+resident path and for the default worker count.
 
 ---
 
