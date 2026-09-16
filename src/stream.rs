@@ -2,11 +2,12 @@
 //!
 //! For inputs that shouldn't be fully materialized — a multi-GB compressed file,
 //! or several at once — [`StreamReader`] decompresses and frames the document on
-//! a single producer thread and parses the framed records in parallel on a
-//! `rayon` pool. A bounded channel between them provides backpressure, so the
+//! a single producer thread and parses the framed records on a fixed set of
+//! worker threads. A bounded channel between them provides backpressure, so the
 //! producer only runs ahead as far as the workers can drain: resident memory is
-//! bounded by the in-flight records (≈ `threads × record_size`) plus one chunk,
-//! independent of document size.
+//! bounded by the in-flight batches (≈ `queue capacity × batch size`) plus one
+//! chunk, independent of document size. Batch size and queue capacity are
+//! [`Config`] knobs; see [`Config::with_stream_batch_records`].
 //!
 //! Trade-offs vs. the resident [`ParallelXml`](crate::ParallelXml) path: records
 //! are *owned* (copied out of the decompression buffer rather than borrowed), and
@@ -15,22 +16,15 @@
 
 use std::io::Read;
 use std::ops::Range;
-use std::sync::Arc;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use rayon::iter::{ParallelBridge, ParallelIterator};
-
 use crate::scan::StreamFramer;
-use crate::{Prelude, Record, XmlError};
+use crate::{Config, Prelude, Record, XmlError};
 
 /// Bytes pulled from the source per read.
 const CHUNK: usize = 64 * 1024;
-
-/// Records carried per channel message. Batching amortizes the channel send and
-/// the `par_bridge` receiver mutex over many records, and packs a batch's record
-/// bytes into a single arena allocation (one alloc per batch, not per record).
-const BATCH: usize = 256;
 
 /// A batch of framed records sharing one arena allocation. `records` holds each
 /// record's document index and its byte span within `data`. `prelude` is the
@@ -85,16 +79,16 @@ struct Batch {
 /// cache-resident.
 pub struct StreamReader<'a> {
     reader: Box<dyn Read + Send + 'a>,
-    /// Element-name path from the root to the record container (see
-    /// [`Config::with_record_path`](crate::Config::with_record_path)); empty =
-    /// the root's direct children.
-    record_path: Vec<Box<str>>,
+    /// Framing (the record path) plus the pipeline sizing knobs — batch caps,
+    /// channel capacity and worker count. The parallelism thresholds do not
+    /// apply here.
+    config: Config,
 }
 
 impl std::fmt::Debug for StreamReader<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamReader")
-            .field("record_path", &self.record_path)
+            .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
@@ -104,7 +98,7 @@ impl<'a> StreamReader<'a> {
     pub fn from_reader<R: Read + Send + 'a>(reader: R) -> Self {
         Self {
             reader: Box::new(reader),
-            record_path: Vec::new(),
+            config: Config::default(),
         }
     }
 
@@ -115,7 +109,7 @@ impl<'a> StreamReader<'a> {
         let decoder = zstd::Decoder::new(reader)?;
         Ok(Self {
             reader: Box::new(decoder),
-            record_path: Vec::new(),
+            config: Config::default(),
         })
     }
 
@@ -124,15 +118,56 @@ impl<'a> StreamReader<'a> {
     /// [`Config::with_record_path`](crate::Config::with_record_path). Empty =
     /// the root's direct children (the default).
     ///
-    /// `StreamReader` takes no [`Config`](crate::Config) (the parallelism
-    /// thresholds only apply to the resident path), so the path is set here.
+    /// A shorthand for the record path alone; use
+    /// [`with_config`](Self::with_config) to set it together with the pipeline
+    /// sizing knobs.
     pub fn record_path<I, S>(mut self, path: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<Box<str>>,
     {
-        self.record_path = path.into_iter().map(Into::into).collect();
+        self.config.record_path = path.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Override the whole [`Config`] — the record path plus the streaming
+    /// pipeline sizing:
+    /// [batch records](Config::with_stream_batch_records),
+    /// [batch bytes](Config::with_stream_batch_bytes),
+    /// [queue capacity](Config::with_stream_queue_capacity) and
+    /// [worker count](Config::with_stream_workers).
+    ///
+    /// Replaces the configuration rather than merging into it, so a later
+    /// [`record_path`](Self::record_path) call still applies but an earlier one
+    /// is discarded. The parallelism thresholds
+    /// ([`parallel_threshold`](Config::parallel_threshold) /
+    /// [`min_records`](Config::min_records)) are ignored: streaming always runs
+    /// the pipeline.
+    ///
+    /// ```
+    /// use pxml::{Config, StreamReader};
+    ///
+    /// // Smaller batches and a shallower queue: less memory in flight, at the
+    /// // cost of more channel traffic.
+    /// let config = Config::new()
+    ///     .with_stream_batch_records(32)
+    ///     .with_stream_batch_bytes(64 * 1024)
+    ///     .with_stream_queue_capacity(4);
+    ///
+    /// let xml = &b"<trades><trade>1</trade><trade>2</trade></trades>"[..];
+    /// StreamReader::from_reader(xml)
+    ///     .with_config(config)
+    ///     .par_for_each(|record| drop(record.as_bytes()))?;
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = config;
+        self
+    }
+
+    /// The configuration this reader will run with.
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     /// Frame records on a producer thread and apply `f` to each in parallel,
@@ -142,14 +177,23 @@ impl<'a> StreamReader<'a> {
     /// still processed (siblings are not aborted). Per-record parse errors are
     /// the closure's concern (it drives `record.events()`).
     ///
-    /// The workers run on rayon's current pool. To use a specific pool, wrap the
-    /// call: `pool.install(|| reader.par_for_each(f))`.
+    /// Records are parsed on a fixed set of worker threads — by default as many
+    /// as `rayon`'s current pool has, so `pool.install(|| reader.par_for_each(f))`
+    /// still sizes the pipeline from that pool; set
+    /// [`Config::with_stream_workers`] to size it without involving `rayon` at
+    /// all. The workers are plain threads rather than pool tasks, so a closure
+    /// that itself uses `rayon` cannot deadlock against the pipeline.
     pub fn par_for_each<F>(self, f: F) -> Result<(), XmlError>
     where
         F: Fn(&Record) + Sync,
     {
         let mut reader = self.reader;
-        let mut framer = StreamFramer::with_path(self.record_path);
+        // `0` caps would stall the producer (a batch could never fill), so they
+        // mean "one record per batch".
+        let batch_records = self.config.stream_batch_records.max(1);
+        let batch_bytes = self.config.stream_batch_bytes.max(1);
+        let queue_capacity = self.config.stream_queue_capacity;
+        let mut framer = StreamFramer::with_path(self.config.record_path);
         let mut chunk = vec![0u8; CHUNK];
 
         // Parse the prolog on this thread before splitting into producer/workers.
@@ -167,18 +211,28 @@ impl<'a> StreamReader<'a> {
             framer.push(&chunk[..n]);
         }
 
-        let capacity = (rayon::current_num_threads() * 2).max(1);
+        let workers = match self.config.stream_workers {
+            0 => rayon::current_num_threads().max(1),
+            n => n,
+        };
+        let capacity = match queue_capacity {
+            0 => workers * 2,
+            n => n,
+        };
         let (tx, rx) = sync_channel::<Batch>(capacity);
 
         thread::scope(|scope| {
             let producer = scope.spawn(move || -> Result<(), XmlError> {
                 let mut chunk = vec![0u8; CHUNK];
                 loop {
-                    // Pack up to BATCH records into one arena allocation.
+                    // Pack records into one arena allocation, up to whichever
+                    // cap — records or bytes — is reached first. The byte check
+                    // runs after a push, so one record larger than the cap is
+                    // dispatched on its own instead of stalling the pipeline.
                     let mut data = Vec::new();
-                    let mut records = Vec::with_capacity(BATCH);
+                    let mut records = Vec::with_capacity(batch_records.min(1024));
                     let mut need_more = false;
-                    while records.len() < BATCH {
+                    while records.len() < batch_records && data.len() < batch_bytes {
                         match framer.next_record_into(&mut data)? {
                             Some(record) => records.push(record),
                             None => {
@@ -214,19 +268,52 @@ impl<'a> StreamReader<'a> {
                 }
             });
 
-            // Workers pull whole batches and parse their records in parallel. The
-            // bounded channel throttles the producer when the pool is saturated.
-            rx.into_iter().par_bridge().for_each(|batch| {
-                for (index, span) in &batch.records {
-                    let record =
-                        Record::new(&batch.data[span.clone()], batch.prelude.clone(), *index);
-                    f(&record);
-                }
-            });
+            // A fixed set of workers pulls whole batches off the channel and
+            // parses their records. The bounded channel throttles the producer
+            // when the workers fall behind.
+            //
+            // This deliberately does not use `rayon`'s `par_bridge`: bridging a
+            // sequential iterator into the pool costs more than it buys here —
+            // measurably so on parse-heavy records (see DECISIONS.md §22). The
+            // worker count still defaults to the current pool's, so
+            // `pool.install(…)` sizes the pipeline as before.
+            let rx = Mutex::new(rx);
+            consume_batches(&rx, workers, &f);
 
             producer.join().expect("producer thread panicked")
         })
     }
+}
+
+/// Run `workers` threads that pull batches off `rx` until the producer hangs up,
+/// applying `f` to every record of every batch.
+///
+/// The receiver is shared behind a `Mutex` held only across `recv` — never while
+/// parsing — so the workers contend once per *batch*, not once per record.
+/// A poisoned lock means another worker panicked: the remaining workers stop, the
+/// scope joins them, and the panic resumes on this thread — unwinding drops the
+/// receiver, which releases a producer blocked on `send`.
+fn consume_batches<F>(rx: &Mutex<Receiver<Batch>>, workers: usize, f: &F)
+where
+    F: Fn(&Record) + Sync,
+{
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(move || {
+                loop {
+                    let Ok(guard) = rx.lock() else { break };
+                    let batch = guard.recv();
+                    drop(guard);
+                    let Ok(batch) = batch else { break }; // producer finished
+                    for (index, span) in &batch.records {
+                        let record =
+                            Record::new(&batch.data[span.clone()], batch.prelude.clone(), *index);
+                        f(&record);
+                    }
+                }
+            });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -306,6 +393,86 @@ mod tests {
         };
         let got = collect_sorted(StreamReader::from_reader(reader));
         assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
+    /// Every batch shape frames and parses the same records: one record per
+    /// batch, a byte cap that trips first, a one-slot queue, and the defaults.
+    #[test]
+    fn streaming_batch_sizing_does_not_change_results() {
+        let n = 300;
+        let xml = build_doc(n);
+        let expected: Vec<usize> = (0..n).collect();
+
+        let configs = [
+            Config::new().with_stream_batch_records(1),
+            Config::new().with_stream_batch_bytes(1), // one record per batch
+            Config::new()
+                .with_stream_batch_records(7)
+                .with_stream_batch_bytes(32),
+            Config::new().with_stream_queue_capacity(1),
+            Config::new()
+                .with_stream_batch_records(usize::MAX)
+                .with_stream_batch_bytes(usize::MAX),
+            // `0` must not stall the producer: it means one record per batch.
+            Config::new()
+                .with_stream_batch_records(0)
+                .with_stream_batch_bytes(0),
+        ];
+
+        for config in configs {
+            let reader = StreamReader::from_reader(xml.as_bytes()).with_config(config.clone());
+            assert_eq!(collect_sorted(reader), expected, "config: {config:?}");
+        }
+    }
+
+    /// An explicit worker count drives the pipeline without consulting rayon,
+    /// down to a single worker.
+    #[test]
+    fn streaming_honors_an_explicit_worker_count() {
+        let n = 400;
+        let xml = build_doc(n);
+        let expected: Vec<usize> = (0..n).collect();
+
+        for workers in [1, 2, 3] {
+            let reader = StreamReader::from_reader(xml.as_bytes())
+                .with_config(Config::new().with_stream_workers(workers));
+            assert_eq!(collect_sorted(reader), expected, "workers: {workers}");
+        }
+    }
+
+    /// A record larger than the byte cap is dispatched on its own rather than
+    /// stalling the producer waiting for a batch that can never fill.
+    #[test]
+    fn streaming_record_larger_than_the_byte_cap_still_flows() {
+        let big = "x".repeat(8 * 1024);
+        let xml = format!("<rs><r>{big}</r><r>{big}</r></rs>");
+        let lens = Mutex::new(Vec::new());
+
+        StreamReader::from_reader(xml.as_bytes())
+            .with_config(Config::new().with_stream_batch_bytes(64))
+            .par_for_each(|rec| lens.lock().unwrap().push(rec.as_bytes().len()))
+            .unwrap();
+
+        let lens = lens.into_inner().unwrap();
+        assert_eq!(lens.len(), 2);
+        assert!(lens.iter().all(|&l| l == big.len() + 7)); // <r>…</r>
+    }
+
+    /// `with_config` carries the record path; a later `record_path` overrides it.
+    #[test]
+    fn stream_config_and_record_path_compose() {
+        let n = 100;
+        let xml = build_container_doc(n);
+        let expected: Vec<usize> = (0..n).collect();
+
+        let from_config = StreamReader::from_reader(xml.as_bytes())
+            .with_config(Config::new().with_record_path(["objects"]));
+        assert_eq!(collect_sorted(from_config), expected);
+
+        let overridden = StreamReader::from_reader(xml.as_bytes())
+            .with_config(Config::new().with_record_path(["nope"]))
+            .record_path(["objects"]);
+        assert_eq!(collect_sorted(overridden), expected);
     }
 
     #[test]

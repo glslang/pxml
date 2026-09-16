@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use quick_xml::Reader;
 use quick_xml::events::Event as QxEvent;
@@ -111,6 +111,12 @@ use crate::scan::parse_doctype_entities;
 pub struct ParallelXml {
     buf: Buffer,
     config: Config,
+    /// Phase A output, memoized on first use: `index()` and the drivers all
+    /// need the same scan, and the scan is the serial fraction — doing it once
+    /// per document is the difference between one pass over the buffer and one
+    /// per call. Reset by [`with_config`](ParallelXml::with_config), the only
+    /// way the framing can change.
+    index_cache: OnceLock<ChunkIndex>,
 }
 
 /// Backing storage for the document bytes.
@@ -145,6 +151,7 @@ impl fmt::Debug for ParallelXml {
             .field("buffer", &self.buf.kind())
             .field("len", &self.buf.as_slice().len())
             .field("config", &self.config)
+            .field("indexed", &self.index_cache.get().is_some())
             .finish()
     }
 }
@@ -181,6 +188,7 @@ impl ParallelXml {
         Ok(Self {
             buf: Buffer::Mmap(mmap),
             config: Config::default(),
+            index_cache: OnceLock::new(),
         })
     }
 
@@ -189,6 +197,7 @@ impl ParallelXml {
         Self {
             buf: Buffer::Owned(b.into()),
             config: Config::default(),
+            index_cache: OnceLock::new(),
         }
     }
 
@@ -217,6 +226,7 @@ impl ParallelXml {
         Self {
             buf: Buffer::Owned(Cow::Owned(bytes)),
             config: Config::default(),
+            index_cache: OnceLock::new(),
         }
     }
 
@@ -243,6 +253,9 @@ impl ParallelXml {
     /// ```
     pub fn with_config(mut self, cfg: Config) -> Self {
         self.config = cfg;
+        // A new record path frames different records, so the memoized scan no
+        // longer describes this document.
+        self.index_cache = OnceLock::new();
         self
     }
 
@@ -250,6 +263,12 @@ impl ParallelXml {
     ///
     /// Runs the boundary scan without parsing any record, so it is a fast way to
     /// count records or to get their byte ranges for custom dispatch.
+    ///
+    /// The scan is **memoized**: the first call (from here or from any of the
+    /// drivers) scans the buffer, and every later call on the same document
+    /// borrows that result. Clone the returned [`ChunkIndex`] to keep it beyond
+    /// the document's lifetime. [`with_config`](Self::with_config) drops the
+    /// memo, since a new record path frames different records.
     ///
     /// ```
     /// use pxml::ParallelXml;
@@ -262,8 +281,18 @@ impl ParallelXml {
     /// assert_eq!(idx.prelude().root_name.as_ref(), "rs");
     /// # Ok::<(), pxml::XmlError>(())
     /// ```
-    pub fn index(&self) -> Result<ChunkIndex, XmlError> {
-        scan::scan_with(self.buf.as_slice(), &self.config.record_path)
+    pub fn index(&self) -> Result<&ChunkIndex, XmlError> {
+        if let Some(index) = self.index_cache.get() {
+            return Ok(index);
+        }
+        let index = scan::scan_with(self.buf.as_slice(), &self.config.record_path)?;
+        // A racing caller may have filled the slot first; either scan is the
+        // same value, so whichever landed wins and the loser's is dropped.
+        let _ = self.index_cache.set(index);
+        Ok(self
+            .index_cache
+            .get()
+            .expect("index_cache filled just above"))
     }
 
     /// Unordered parallel map over records (the natural "any order" API).
@@ -295,7 +324,7 @@ impl ParallelXml {
         F: Fn(&Record) + Sync,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan_with(buf, &self.config.record_path)?;
+        let index = self.index()?;
         let prelude = &index.prelude;
         let make = |i: usize, r: &Range<usize>| Record {
             bytes: &buf[r.clone()],
@@ -323,7 +352,7 @@ impl ParallelXml {
         F: Fn(&Record) -> T + Sync,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan_with(buf, &self.config.record_path)?;
+        let index = self.index()?;
         let prelude = &index.prelude;
         let make = |i: usize, r: &Range<usize>| Record {
             bytes: &buf[r.clone()],
@@ -360,7 +389,7 @@ impl ParallelXml {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan_with(buf, &self.config.record_path)?;
+        let index = self.index()?;
         let prelude = &index.prelude;
         let one = |i: usize, r: &Range<usize>| {
             let rec = Record {
@@ -431,7 +460,7 @@ impl ParallelXml {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let buf = self.buf.as_slice();
-        let index = scan::scan_with(buf, &self.config.record_path)?;
+        let index = self.index()?;
         let prelude = &index.prelude;
         let one = |i: usize, r: &Range<usize>| {
             let rec = Record {

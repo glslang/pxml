@@ -46,6 +46,13 @@ zstd      = { version = "0.14", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+divan    = "0.1"
 
 [[example]]
 name = "bench"
+
+# The repeatable performance suite: `cargo bench`. `examples/bench.rs` stays as
+# the exploratory driver (it also generates test files and runs real ones).
+[[bench]]
+name = "throughput"
+harness = false

@@ -23,13 +23,18 @@ cargo test --features memchr-framer     # opt-in memchr/memmem streaming framer
 cargo test scan::                       # run one module's tests (also: parse::, tests:: for lib)
 cargo test test_name_substring          # run a single test by (sub)name
 
+cargo bench                             # the divan suite in benches/throughput.rs (canonical perf harness)
+cargo bench -- streaming                # one module (also: phase_a, resident, compressed)
+cargo bench --features memchr-framer -- streaming   # A/B the streaming framer
+
 cargo run --release --example bench                       # in-memory throughput sweep (release is essential)
 cargo run --release --example bench -- 500000 1,4,8       # explicit record count + thread list
 cargo run --release --example bench -- gen 1000000 trades.xml.zst  # generate a zstd test file
 cargo run --release --example bench -- file trades.xml.zst         # resident vs streaming on a real file
 ```
 
-Tests live inline (`#[cfg(test)]` modules) in each source file, not a separate `tests/` dir.
+Tests live inline (`#[cfg(test)]` modules) in each source file, plus
+`tests/public_api.rs`, which exercises the crate through its public surface only.
 Property tests use `proptest`; regression seeds are checked in under `proptest-regressions/`
 — do not delete them.
 
@@ -67,14 +72,19 @@ attribute value, comment, CDATA, PI, or DTD. So work is split in two:
   `Event` → pxml `Event`, with entity decoding).
 - `src/event.rs` — public `Event`, `Attrs`/`Attribute` attribute iteration.
 - `src/prelude.rs` — `Prelude`, `Encoding`, `NamespaceContext` (shared immutable context).
-- `src/stream.rs` — `StreamReader`: bounded-memory pipeline (producer thread frames +
-  rayon parses with a backpressured channel); records are **owned and unordered**.
-- `src/config.rs` — `Config` (`parallel_threshold`, `min_records`).
+- `src/stream.rs` — `StreamReader`: bounded-memory pipeline (producer thread frames,
+  a fixed set of worker threads parses, backpressured channel between them — not
+  `par_bridge`, see DECISIONS §22); records are **owned and unordered**.
+- `src/config.rs` — `Config` (`parallel_threshold`, `min_records`, `record_path`,
+  and the `stream_*` pipeline sizing knobs).
+- `benches/throughput.rs` — the `divan` performance suite (DECISIONS §19).
 
 ### Two execution paths — keep them in mind when changing behavior
 
 1. **Resident** (`ParallelXml::from_path`/`from_bytes`/`from_zstd_*`): whole document
-   in memory; workers borrow slices; supports ordered `map_collect`. Below
+   in memory; workers borrow slices; supports ordered `map_collect`. The Phase A
+   scan is memoized in a `OnceLock` shared by `index()` and every driver, and
+   dropped by `with_config`. Below
    `Config::parallel_threshold` bytes **or** `Config::min_records` records, the
    drivers transparently fall back to a single sequential pass — a behavior any change
    to the drivers must preserve.
@@ -99,6 +109,10 @@ attribute value, comment, CDATA, PI, or DTD. So work is split in two:
   errors the same way. Keep the `index` accurate.
 - **Rejected, not silently skipped:** external DTDs / parameter entities →
   `XmlError::UnsupportedDtd`; non-UTF-8 / UTF-16 BOM → `XmlError::Encoding`.
+- **Streaming sizing is configurable, not constant:** batch records/bytes, queue
+  capacity and worker count come from `Config`; a batch closes on whichever cap
+  comes first, and a record larger than the byte cap must still be dispatched
+  alone rather than stalling the producer.
 - **Feature gating:** `zstd` is default-on but optional (pure-Rust build via
   `--no-default-features`); `memchr-framer` swaps the streaming framer's scan strategy.
   Anything touching these must compile and test under all three feature combinations

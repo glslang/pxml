@@ -20,7 +20,12 @@ use crate::XmlError;
 use crate::prelude::{Encoding, NamespaceContext, Prelude};
 
 /// Phase A output: framing only, no parsing.
-#[derive(Debug)]
+///
+/// Cloning is cheap relative to rescanning (it copies the record ranges and
+/// bumps the prelude's refcount), but
+/// [`ParallelXml::index`](crate::ParallelXml::index) hands out a borrow of a
+/// cached index, so cloning is only needed to keep one past the document.
+#[derive(Debug, Clone)]
 pub struct ChunkIndex {
     pub(crate) prelude: Arc<Prelude>,
     pub(crate) records: Vec<Range<usize>>,
@@ -28,8 +33,24 @@ pub struct ChunkIndex {
 
 impl ChunkIndex {
     /// Shared, immutable prolog context for every record.
-    pub fn prelude(&self) -> &Arc<Prelude> {
+    pub fn prelude(&self) -> &Prelude {
         &self.prelude
+    }
+
+    /// The shared prolog context as an `Arc`, cheaply cloned — for holding onto
+    /// the context (or handing it to another thread) after the index is gone.
+    ///
+    /// ```
+    /// use pxml::ParallelXml;
+    ///
+    /// let doc = ParallelXml::from_bytes(&b"<rs><r>a</r></rs>"[..]);
+    /// let prelude = doc.index()?.prelude_arc();
+    ///
+    /// assert_eq!(prelude.root_name.as_ref(), "rs");
+    /// # Ok::<(), pxml::XmlError>(())
+    /// ```
+    pub fn prelude_arc(&self) -> Arc<Prelude> {
+        Arc::clone(&self.prelude)
     }
 
     /// Byte ranges of the top-level records, in document order.
