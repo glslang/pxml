@@ -48,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   noise elsewhere, and a closure that itself uses `rayon` can no longer contend
   with the pipeline for pool threads. The default worker count still comes from
   `rayon::current_num_threads()`, so `pool.install(…)` sizes the pipeline as
-  before. See `DECISIONS.md` §22.
+  before, and a panic in the closure stops the pipeline instead of letting it
+  finish the document first. See `DECISIONS.md` §22.
 
 ## [0.2.0] — 2026-09-13
 

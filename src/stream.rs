@@ -18,6 +18,7 @@
 
 use std::io::Read;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -292,17 +293,35 @@ impl<'a> StreamReader<'a> {
 ///
 /// The receiver is shared behind a `Mutex` held only across `recv` — never while
 /// parsing — so the workers contend once per *batch*, not once per record.
-/// A poisoned lock means another worker panicked: the remaining workers stop, the
-/// scope joins them, and the panic resumes on this thread — unwinding drops the
-/// receiver, which releases a producer blocked on `send`.
+///
+/// # A panicking closure must not drain the document first
+///
+/// `f` runs outside the lock, so a panic in it cannot poison the mutex — without
+/// the `stop` flag the surviving workers would keep pulling, and the panic would
+/// not surface until the *whole* document had been framed and parsed. [`StopOnExit`]
+/// sets the flag as the panicking worker unwinds, so the others leave the loop
+/// after at most the batch already in hand; the scope then joins them and resumes
+/// the panic, and unwinding drops the receiver, which releases a producer blocked
+/// on `send`.
+///
+/// Setting the flag on a *normal* exit too is harmless and costs nothing: a
+/// worker only exits normally on `RecvError`, which `std` returns once the
+/// channel is both empty and disconnected, so there is nothing left to pull.
+///
+/// What this cannot shorten is a producer blocked inside `Read::read` on a source
+/// that yields nothing further: the scope must join that thread, so the panic
+/// surfaces when the read returns. See [`StreamReader::par_for_each`].
 fn consume_batches<F>(rx: &Mutex<Receiver<Batch>>, workers: usize, f: &F)
 where
     F: Fn(&Record) + Sync,
 {
+    let stop = AtomicBool::new(false);
     thread::scope(|scope| {
         for _ in 0..workers {
+            let stop = &stop;
             scope.spawn(move || {
-                loop {
+                let _stop_siblings = StopOnExit(stop);
+                while !stop.load(Ordering::Relaxed) {
                     let Ok(guard) = rx.lock() else { break };
                     let batch = guard.recv();
                     drop(guard);
@@ -318,12 +337,25 @@ where
     });
 }
 
+/// Signals the sibling workers to stop as soon as one leaves its loop — including
+/// by unwinding out of a panicking closure, which is the case that matters (see
+/// [`consume_batches`]).
+struct StopOnExit<'a>(&'a AtomicBool);
+
+impl Drop for StopOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Event;
     use std::io;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
     fn build_doc(n: usize) -> String {
         let mut s = String::from("<records>");
@@ -475,6 +507,44 @@ mod tests {
             .with_config(Config::new().with_record_path(["nope"]))
             .record_path(["objects"]);
         assert_eq!(collect_sorted(overridden), expected);
+    }
+
+    /// A panicking closure propagates *and* stops the pipeline: without the stop
+    /// flag the surviving workers keep pulling and the panic does not surface
+    /// until the whole document has been parsed, so this asserts on how few
+    /// records were seen, not just that the panic arrived.
+    #[test]
+    fn streaming_worker_panic_stops_the_pipeline() {
+        const RECORDS: usize = 100_000;
+        const WORKERS: usize = 4;
+
+        let xml = build_doc(RECORDS);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+
+        // The default hook symbolizes a backtrace under `RUST_BACKTRACE=1`,
+        // which runs *before* unwinding starts — long enough for the siblings to
+        // drain a small document and turn this into a timing test. Silence it
+        // for the duration, so what is measured is the stop flag.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(move || {
+            // Only *one* record panics, so the other workers are alive and
+            // pulling — exactly the case the flag has to interrupt.
+            StreamReader::from_reader(xml.as_bytes())
+                .with_config(Config::new().with_stream_workers(WORKERS))
+                .par_for_each(move |rec| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    assert!(rec.index() != 0, "closure failed");
+                })
+        });
+        std::panic::set_hook(hook);
+
+        assert!(result.is_err(), "the panic must reach the caller");
+        // Each worker stops after at most the batch it already holds, so the
+        // ceiling is a few batches — orders of magnitude below draining 100k.
+        let seen = seen.load(Ordering::Relaxed);
+        assert!(seen < 10_000, "drained {seen} records after the panic");
     }
 
     #[test]
